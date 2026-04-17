@@ -77,6 +77,7 @@ def _tq_decode_stage1(
     KEY_FP8: tl.constexpr,  # 1 if K is stored as FP8
     NORM_CORRECTION: tl.constexpr = 0,  # 1 = re-normalize centroids
     FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
+    SLIDING_WINDOW: tl.constexpr = 0,  # 0 = full attention, >0 = window lookback size
 ):
     bid = tl.program_id(0)  # batch index
     hid = tl.program_id(1)  # q_head index
@@ -87,10 +88,17 @@ def _tq_decode_stage1(
     # Sequence length for this batch
     seq_len = tl.load(Seq_lens_ptr + bid)
 
-    # KV split range
-    split_len = tl.cdiv(seq_len, NUM_KV_SPLITS)
-    split_start = split_len * sid
-    split_end = tl.minimum(split_start + split_len, seq_len)
+    # Sliding window: restrict effective range to recent tokens
+    if SLIDING_WINDOW > 0:
+        window_start = tl.maximum(seq_len - SLIDING_WINDOW, 0)
+    else:
+        window_start = 0
+
+    # KV split range (over the windowed region)
+    effective_len = seq_len - window_start
+    split_len = tl.cdiv(effective_len, NUM_KV_SPLITS)
+    split_start = window_start + split_len * sid
+    split_end = tl.minimum(window_start + split_len * (sid + 1), seq_len)
 
     if split_start >= split_end:
         return
@@ -497,6 +505,7 @@ def triton_turboquant_decode_attention(
     lse_buf: torch.Tensor | None = None,
     buf_holder: Any = None,
     max_num_kv_splits: int = 32,  # fixed split count (must be constant for cudagraph)
+    sliding_window: int = 0,  # 0 = full attention, >0 = window lookback size
 ) -> torch.Tensor:
     """Launch fused TQ decode attention (Triton stage1 + stage2).
 
@@ -577,6 +586,7 @@ def triton_turboquant_decode_attention(
         KEY_FP8=1 if key_fp8 else 0,
         NORM_CORRECTION=1 if norm_correction else 0,
         FP8_E4B15=fp8_e4b15,
+        SLIDING_WINDOW=sliding_window,
         num_warps=1,
         num_stages=1,
     )

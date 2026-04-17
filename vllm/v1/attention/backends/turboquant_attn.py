@@ -254,6 +254,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.num_kv_groups = num_heads // self.num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
+        self.sliding_window = sliding_window
+        if sliding_window is not None:
+            self.fa_window_size = (sliding_window - 1, 0)
+        else:
+            self.fa_window_size = None
 
         from vllm.model_executor.layers.quantization.turboquant.config import (
             TurboQuantConfig,
@@ -518,6 +523,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seqlen_k=attn_metadata.max_query_len,
                 softmax_scale=self.scale,
                 causal=True,
+                window_size=self.fa_window_size,
                 out=output,
             )
             return output
@@ -570,6 +576,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         max_seqlen_k=q_len,
                         softmax_scale=self.scale,
                         causal=True,
+                        window_size=self.fa_window_size,
                         out=out,
                     )
                 else:
@@ -615,6 +622,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         key_fp8=self.tq_config.key_fp8,
                         norm_correction=self.tq_config.norm_correction,
                         PiT=PiT,
+                        sliding_window=self.sliding_window or 0,
                     )
                 else:
                     # Large continuation: dequant cached K/V and use
@@ -746,6 +754,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seqlen_k=seq_len,
                 softmax_scale=self.scale,
                 causal=True,
+                window_size=self.fa_window_size,
                 out=output,
             )
             return output
@@ -808,5 +817,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             lse_buf=lse_buf,
             buf_holder=layer,
             max_num_kv_splits=self.max_num_kv_splits,
+            sliding_window=self.sliding_window or 0,
         )
         return result
