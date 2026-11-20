@@ -322,7 +322,7 @@ class _Dsv4TopkCutlass:
         stream: cuda.CUstream,
     ):
         if cutlass.const_expr(self.num_warps == 1):
-            self.kernel_1w(
+            self.single_warp_kernel(
                 gating_output,
                 correction_bias,
                 is_padding,
@@ -346,7 +346,7 @@ class _Dsv4TopkCutlass:
                 cand_id: cute.struct.MemRange[Int32, self.candidates]
                 cand_score: cute.struct.MemRange[Float32, self.candidates]
 
-            self.kernel_4w(
+            self.multi_warp_kernel(
                 gating_output,
                 correction_bias,
                 is_padding,
@@ -423,7 +423,7 @@ class _Dsv4TopkCutlass:
                 )
 
     @cute.kernel
-    def kernel_1w(
+    def single_warp_kernel(
         self,
         gating_output: Int64,
         correction_bias: Int64,
@@ -503,7 +503,7 @@ class _Dsv4TopkCutlass:
         )
 
     @cute.kernel
-    def kernel_4w(
+    def multi_warp_kernel(
         self,
         gating_output: Int64,
         correction_bias: Int64,
