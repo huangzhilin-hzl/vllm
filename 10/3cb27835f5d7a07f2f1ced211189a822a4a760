@@ -1,0 +1,14 @@
+vllm/model_executor/layers/fused_moe/router/dsv4_topk_cutedsl.py
+  h_65d95dfcbf63bf 325,349,426,506
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "103cb27835f5d7a07f2f1ced211189a822a4a760",
+  "prompts": {},
+  "humans": {
+    "h_65d95dfcbf63bf": {
+      "author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    }
+  }
+}
