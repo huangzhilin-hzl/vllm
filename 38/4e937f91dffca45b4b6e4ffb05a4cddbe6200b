@@ -1,0 +1,16 @@
+tests/kernels/test_ll_bf16_gemm.py
+  h_65d95dfcbf63bf 100,217-218
+vllm/model_executor/kernels/linear/cute_dsl/ll_bf16.py
+  h_65d95dfcbf63bf 37,61,71
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "384e937f91dffca45b4b6e4ffb05a4cddbe6200b",
+  "prompts": {},
+  "humans": {
+    "h_65d95dfcbf63bf": {
+      "author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    }
+  }
+}
