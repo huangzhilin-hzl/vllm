@@ -20,12 +20,16 @@ from cutlass.cute.runtime import make_fake_stream
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from vllm.platforms import current_platform
-from vllm.utils.torch_utils import current_stream
 
 _TOPK = 6
 _MULTI_WARP_MAX_TOKENS = 256
 _SUPPORTED_NUM_EXPERTS = (256, 384)
 _SmemAllocator = getattr(cutlass, "memory", cutlass.utils).SmemAllocator
+
+
+@cache
+def _device_supports_pdl(device_index: int) -> bool:
+    return current_platform.has_device_capability(90, device_id=device_index)
 
 
 def _asm(
@@ -100,6 +104,23 @@ def _load_s64_nc(addr: Int64, *, loc=None, ip=None) -> Int64:
 
 
 @dsl_user_op
+def _load_f32_ordered(addr: Int64, *, loc=None, ip=None) -> Float32:
+    # Coherent, side-effecting load so ptxas cannot hoist PDL-dependent logits
+    # across griddepcontrol_wait() or read stale non-coherent cache lines.
+    return Float32(
+        _asm(
+            T.f32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.global.f32 $0, [$1];",
+            "=f,l",
+            True,
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
 def _load_u8(addr: Int64, *, loc=None, ip=None) -> Uint32:
     return Uint32(
         _asm(
@@ -107,7 +128,7 @@ def _load_u8(addr: Int64, *, loc=None, ip=None) -> Uint32:
             [Int64(addr).ir_value(loc=loc, ip=ip)],
             "{ .reg .u16 t; ld.global.u8 t, [$1]; cvt.u32.u16 $0, t; }",
             "=r,l",
-            False,
+            True,
             loc,
             ip,
         )
@@ -432,7 +453,7 @@ class _Dsv4TopkCutlass:
         key = cute.make_rmem_tensor(cute.make_layout(per_lane), Uint32)
         row_base = gating_output + Int64(row) * (self.num_experts * 4)
         for j in cutlass.range_constexpr(per_lane):
-            logit = _load_f32_nc(row_base + Int64(j * 32 + lane) * 4)
+            logit = _load_f32_ordered(row_base + Int64(j * 32 + lane) * 4)
             score[j], key[j] = _score_and_key(logit, b_arr[j])
 
         best_key = Uint32(key[0])
@@ -524,7 +545,7 @@ class _Dsv4TopkCutlass:
         row_base = gating_output + Int64(row) * (self.num_experts * 4)
         for j in cutlass.range_constexpr(per_lane):
             e = warp_base + j * 32 + lane
-            logit = _load_f32_nc(row_base + Int64(e) * 4)
+            logit = _load_f32_ordered(row_base + Int64(e) * 4)
             score[j], key[j] = _score_and_key(logit, b_arr[j])
 
         # Stage 1: each warp independently selects its top-6 via redux.sync.
@@ -669,16 +690,21 @@ def dsv4_topk_cutedsl(
     topk_ids = gating_output.new_empty(shape, dtype=indices_dtype)
     if num_tokens > 0:
         num_warps = 4 if num_tokens <= _MULTI_WARP_MAX_TOKENS else 1
+        device_index = gating_output.device.index
         compiled = _compiled_dsv4_topk(
-            device_index=gating_output.device.index,
+            device_index=device_index,
             num_experts=num_experts,
             num_warps=num_warps,
             has_padding=has_padding,
             has_vl=has_vl,
             input_ids_is_int64=input_ids_is_int64,
             is_int64=is_int64,
-            use_pdl=current_platform.is_arch_support_pdl(),
+            use_pdl=_device_supports_pdl(device_index),
         )
+        stream = torch.accelerator.current_stream(gating_output.device)
+        stream_handle = getattr(stream, "native_handle", None)
+        if stream_handle is None:
+            stream_handle = stream.cuda_stream  # type: ignore[attr-defined]
         compiled(
             Int64(gating_output.data_ptr()),
             Int64(correction_bias.data_ptr()),
@@ -690,6 +716,6 @@ def dsv4_topk_cutedsl(
             Int32(num_tokens),
             Int32(image_sentinel_lo),
             Float32(routed_scaling_factor),
-            cuda.CUstream(current_stream().cuda_stream),
+            cuda.CUstream(stream_handle),
         )
     return topk_weights, topk_ids

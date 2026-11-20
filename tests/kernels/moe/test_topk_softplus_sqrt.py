@@ -859,3 +859,173 @@ def test_dsv4_topk_cutedsl_matches_triton_bit_exact(
     assert out_ids.dtype == indices_dtype
     torch.testing.assert_close(out_ids, ref_ids, atol=0, rtol=0)
     torch.testing.assert_close(out_w, ref_w, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not is_cutedsl_dsv4_topk_available(),
+    reason="CuTe-DSL dsv4_topk requires CUDA SM80+ with cutlass.cute.",
+)
+@pytest.mark.parametrize("num_tokens", [17, 300])
+@pytest.mark.parametrize("num_experts", [256, 384])
+def test_dsv4_topk_cutedsl_ties_and_neg_inf_parity(
+    num_tokens: int,
+    num_experts: int,
+):
+    """Verify final-score ties (across all 4 warps), +/-0.0 ties, and -inf bias."""
+    from vllm.model_executor.layers.fused_moe.router.dsv4_topk_cutedsl import (
+        dsv4_topk_cutedsl,
+    )
+
+    torch.manual_seed(7)
+    # 1. Exact ties on final (score + bias) spanning all 4 warps (> 6 tied).
+    logits = torch.full(
+        (num_tokens, num_experts), -20.0, dtype=torch.float32, device="cuda"
+    )
+    bias = torch.zeros(num_experts, dtype=torch.float32, device="cuda")
+    tied_ids = [5, 37, 101, 133, 197, 229, 250]
+    logits[0, tied_ids] = 2.0
+    # Signed-zero tie on final score + bias: softplus(-100) == 0 -> sqrt == 0.
+    logits[1] = -100.0
+    bias_zero_tie = torch.full((num_experts,), -1.0, dtype=torch.float32, device="cuda")
+    bias_zero_tie[tied_ids] = 0.0
+    bias_zero_tie[tied_ids[1::2]] = -0.0
+
+    for row_logits, row_bias, expected_row0 in [
+        (logits, bias, tied_ids[:6]),
+        (logits[1:2].repeat(num_tokens, 1), bias_zero_tie, tied_ids[:6]),
+        # All -inf bias: selects 6 distinct lowest expert IDs 0..5.
+        (
+            torch.zeros((num_tokens, num_experts), dtype=torch.float32, device="cuda"),
+            torch.full(
+                (num_experts,), -float("inf"), dtype=torch.float32, device="cuda"
+            ),
+            [0, 1, 2, 3, 4, 5],
+        ),
+    ]:
+        ref_w, ref_ids = _dsv4_topk_triton(row_logits, row_bias, torch.int32, 1.5)
+        out_w, out_ids = dsv4_topk_cutedsl(row_logits, row_bias, torch.int32, 1.5)
+        torch.testing.assert_close(out_ids, ref_ids, atol=0, rtol=0)
+        torch.testing.assert_close(out_w, ref_w, atol=0, rtol=0)
+        assert out_ids[0].tolist() == expected_row0
+
+    # Partial -inf bias (< 6 finite experts): finite winners first, then lowest IDs.
+    partial_bias = torch.full(
+        (num_experts,), -float("inf"), dtype=torch.float32, device="cuda"
+    )
+    partial_bias[200] = 5.0
+    partial_bias[100] = 3.0
+    zero_logits = torch.zeros(
+        (num_tokens, num_experts), dtype=torch.float32, device="cuda"
+    )
+    ref_w, ref_ids = _dsv4_topk_triton(zero_logits, partial_bias, torch.int32, 1.5)
+    out_w, out_ids = dsv4_topk_cutedsl(zero_logits, partial_bias, torch.int32, 1.5)
+    torch.testing.assert_close(out_ids, ref_ids, atol=0, rtol=0)
+    torch.testing.assert_close(out_w, ref_w, atol=0, rtol=0)
+    assert out_ids[0].tolist() == [200, 100, 0, 1, 2, 3]
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="The DeepSeek V4 fast path is CUDA-only.",
+)
+def test_dsv4_topk_direct_entry_unsupported_dtypes_fallback():
+    """Direct dsv4_topk calls with unsupported dtypes fall back safely to Triton."""
+    torch.manual_seed(0)
+    num_tokens, num_experts = 8, 384
+    logits_f32 = torch.randn(
+        (num_tokens, num_experts), dtype=torch.float32, device="cuda"
+    )
+    bias = torch.randn(num_experts, dtype=torch.float32, device="cuda")
+
+    # int16 indices (2 bytes/elem) must not enter the 4-byte CuTe-DSL writer.
+    out_w, out_ids = dsv4_topk(logits_f32, bias, torch.int16, 1.5)
+    ref_w, ref_ids = _dsv4_topk_triton(logits_f32, bias, torch.int16, 1.5)
+    assert out_ids.dtype == torch.int16
+    torch.testing.assert_close(out_ids, ref_ids, atol=0, rtol=0)
+    torch.testing.assert_close(out_w, ref_w, atol=0, rtol=0)
+
+    # bf16 logits (2 bytes/elem) must not enter the 4-byte CuTe-DSL reader.
+    logits_bf16 = logits_f32.to(torch.bfloat16)
+    out_w2, out_ids2 = dsv4_topk(logits_bf16, bias, torch.int32, 1.5)
+    ref_w2, ref_ids2 = _dsv4_topk_triton(logits_bf16, bias, torch.int32, 1.5)
+    torch.testing.assert_close(out_ids2, ref_ids2, atol=0, rtol=0)
+    torch.testing.assert_close(out_w2, ref_w2, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not is_cutedsl_dsv4_topk_available(),
+    reason="CuTe-DSL dsv4_topk requires CUDA SM80+ with cutlass.cute.",
+)
+def test_dsv4_topk_cutedsl_accelerator_stream_and_pdl_replay():
+    """Verify torch.accelerator.set_stream ordering and PDL GEMM->topk replay."""
+    torch.manual_seed(11)
+    device = torch.device("cuda", 0)
+    num_tokens, num_experts = 8, 384
+    bias = torch.zeros(num_experts, dtype=torch.float32, device=device)
+
+    # 1. Stream switch via torch.accelerator.set_stream (bypassing torch.cuda).
+    alt_stream = torch.Stream(device=device)
+    prev_stream = torch.accelerator.current_stream(device)
+    logits = torch.full(
+        (num_tokens, num_experts), -10.0, dtype=torch.float32, device=device
+    )
+    torch.accelerator.synchronize()
+    try:
+        torch.accelerator.set_stream(alt_stream)
+        logits[:, 10:16] = 10.0
+        out_w, out_ids = dsv4_topk(logits, bias, torch.int32, 1.5)
+    finally:
+        torch.accelerator.set_stream(prev_stream)
+    alt_stream.synchronize()
+    expected = torch.arange(10, 16, dtype=torch.int32, device=device).expand(
+        num_tokens, 6
+    )
+    torch.testing.assert_close(out_ids, expected, atol=0, rtol=0)
+    assert out_w.isfinite().all()
+
+    # 2. PDL CUDA-graph replay reusing the exact same captured logits buffer
+    #    across alternating ll_bf16 split-K GEMM inputs with disjoint expert IDs.
+    from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
+        is_available as is_ll_bf16_available,
+    )
+    from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
+        ll_bf16_gemm,
+    )
+
+    if not is_ll_bf16_available():
+        return
+
+    k_dim = 5120
+    w_gate = torch.zeros((num_experts, k_dim), dtype=torch.bfloat16, device=device)
+    w_gate[0:6, 0] = 4.0
+    w_gate[200:206, 1] = 4.0
+    x_buf = torch.zeros((num_tokens, k_dim), dtype=torch.bfloat16, device=device)
+
+    # Warmup before graph capture.
+    x_buf[:, 0] = 1.0
+    warm_logits = ll_bf16_gemm(x_buf, w_gate, output_dtype=torch.float32)
+    dsv4_topk(warm_logits, bias, torch.int32, 1.5)
+    torch.accelerator.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        # Captured output buffer address is reused across all replays.
+        g_logits = ll_bf16_gemm(x_buf, w_gate, output_dtype=torch.float32)
+        g_w, g_ids = dsv4_topk(g_logits, bias, torch.int32, 1.5)
+
+    exp_a = torch.arange(0, 6, dtype=torch.int32, device=device).expand(num_tokens, 6)
+    exp_b = torch.arange(200, 206, dtype=torch.int32, device=device).expand(
+        num_tokens, 6
+    )
+    for step in range(8):
+        x_buf.zero_()
+        if step % 2 == 0:
+            x_buf[:, 0] = 1.0
+            exp = exp_a
+        else:
+            x_buf[:, 1] = 1.0
+            exp = exp_b
+        graph.replay()
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(g_ids, exp, atol=0, rtol=0)
+        assert g_w.isfinite().all()
