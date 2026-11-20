@@ -934,15 +934,14 @@ def _ampere_default_config(
 
 
 @cache
-def _regstream_config(
-    n: int, k: int, x_tiles: int, device_index: int | None
+def _regstream_default_config(
+    n: int, k: int, x_tiles: int, sms: int, smem_limit: int
 ) -> GemvConfig:
     """SM90+ `RegStreamPdlMxfp8Gemv` wave-aware work-split search.
 
     Allows non-power-of-two `warps_n` (5) and `warps_k` (3) so shapes such as
     K=288 (9 groups) and N=5120 (320 tiles) fill all SMs evenly.
     """
-    sms, smem_limit = _device_limits(device_index)
     rows = x_tiles * X_TILE
     tiles = n // TILE_ROWS
     k_groups = k // GROUP
@@ -1003,10 +1002,10 @@ def _regstream_config(
 @cache
 def default_config(n: int, k: int, rows: int, device: torch.device) -> GemvConfig:
     """The work split of a shape (module docstring)."""
+    sms, smem_limit = _device_limits(device.index)
     if _supports_regstream_pdl(device.index):
         x_tiles = (rows + X_TILE - 1) // X_TILE
-        return _regstream_config(n, k, x_tiles, device.index)
-    sms, smem_limit = _device_limits(device.index)
+        return _regstream_default_config(n, k, x_tiles, sms, smem_limit)
     return _ampere_default_config(n, k, rows, sms, smem_limit)
 
 
