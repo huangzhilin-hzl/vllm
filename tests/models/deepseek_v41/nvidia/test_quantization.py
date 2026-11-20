@@ -242,6 +242,7 @@ def test_gemv_linear_reload(monkeypatch):
     kernel = _linear_kernel(monkeypatch, layer)
     kernel.process_weights_after_loading(layer)
     first = kernel.gemv
+    first_partials = kernel._gemv_partials
     x = torch.randn(rows, k, dtype=torch.bfloat16, device="cuda")
     out = torch.empty(rows, n, dtype=torch.bfloat16, device="cuda")
     out.copy_(kernel.apply_weights(layer, x))
@@ -257,6 +258,7 @@ def test_gemv_linear_reload(monkeypatch):
     weight.data.copy_(layer.weight.data)
     layer.weight = weight
     assert kernel.gemv is first
+    assert kernel._gemv_partials is first_partials
 
     graph.replay()
     assert torch.equal(out, kernel.apply_weights(layer, x))
