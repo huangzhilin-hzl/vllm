@@ -112,7 +112,12 @@ def bf16_mxfp8_linear_method_cls() -> type[ModelOptLinearMethod]:
         ModelOptLinearMethod,
     )
 
-    from .specialized_decode.ampere.gemv import mxfp8_gemv
+    from .specialized_decode.ampere.gemv import (
+        GROUP,
+        TILE_ROWS,
+        max_partials_size,
+        mxfp8_gemv,
+    )
 
     class DecodeGemvMxfp8LinearKernel(EmulationMxfp8LinearKernel):
         """BF16 cuBLAS on the weights dequantized at load, and the FP8 GEMV
@@ -122,6 +127,9 @@ def bf16_mxfp8_linear_method_cls() -> type[ModelOptLinearMethod]:
         # counters (one per 16 rows; projections of one layer run on several
         # streams at once), or None when the GEMV cannot take the weight.
         gemv: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        # Per-weight persistent FP32 split-K partials scratch buffer (or None
+        # when no decode batch size splits K for this weight's shape).
+        _gemv_partials: torch.Tensor | None = None
 
         def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
             weight, scales = layer.weight, layer.weight_scale
@@ -149,6 +157,16 @@ def bf16_mxfp8_linear_method_cls() -> type[ModelOptLinearMethod]:
                     blocks.shape[0], dtype=torch.int32, device=blocks.device
                 )
                 self.gemv = (blocks, factors, counters)
+                work = max_partials_size(
+                    blocks.shape[0] * TILE_ROWS,
+                    blocks.shape[1] * GROUP,
+                    blocks.device,
+                )
+                self._gemv_partials = (
+                    torch.empty(work, dtype=torch.float32, device=blocks.device)
+                    if work > 0
+                    else None
+                )
 
         def apply_weights(
             self,
@@ -167,7 +185,13 @@ def bf16_mxfp8_linear_method_cls() -> type[ModelOptLinearMethod]:
                 and x.data_ptr() % 16 == 0
             ):
                 blocks, factors, counters = self.gemv
-                return mxfp8_gemv(x, blocks, factors, counters=counters)
+                return mxfp8_gemv(
+                    x,
+                    blocks,
+                    factors,
+                    counters=counters,
+                    partials=self._gemv_partials,
+                )
             return super().apply_weights(layer, x, bias)
 
     class BF16Mxfp8LinearMethod(ModelOptLinearMethod):

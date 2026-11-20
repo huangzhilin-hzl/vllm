@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The SM80 MXFP8 decode GEMM (`gemv.py`) against its PyTorch reference
+"""The SM80/SM90+ MXFP8 decode GEMM (`gemv.py`) against its PyTorch reference
 and cuBLAS.
 
 * Weight decoding, exact: rows of `x` that select single columns return
@@ -18,7 +18,8 @@ and cuBLAS.
   the FP32 summation order, and the self-resetting ticket counters.
 * The row-expanded scale copy the loader keeps, and CUDA-graph replay.
 
-The kernel uses SM80 instructions only, so any SM80-or-newer GPU runs it.
+SM80 runs the `cp.async` kernel (`Mxfp8Gemv`) and SM90+ runs the zero-weight-SMEM
+register-streaming PDL kernel (`RegStreamPdlMxfp8Gemv`).
 """
 
 import pytest
@@ -161,3 +162,73 @@ def test_expanded_scales_and_graph():
         out.zero_()
         graph.replay()
         assert torch.equal(out, gemv.mxfp8_gemv(x, weight, block_scales))
+
+
+def test_persistent_partials_and_non_pow2_config():
+    """Persistent partials buffers reuse cleanly across launches and CUDA
+    graphs; non-power-of-two configs (e.g. warps_n=5, warps_k=3) match the
+    reference."""
+    from vllm.models.deepseek_v41.nvidia.specialized_decode.ampere import gemv
+
+    # Non-power-of-two (warps_n=5, warps_k=3, groups=3) on K=288 (9 groups).
+    n, k, rows = 5120, 288, 24
+    codes, scales = _weight(n, k, 112, 122, seed=5)
+    weight, block_scales = gemv.pack_weight(codes, scales)
+    x = torch.randn(rows, k, device=DEVICE).to(torch.bfloat16)
+    want = reference.mxfp8_linear(x, codes, scales)
+    bound = _bound(x, reference.mxfp8_weight_dequantize(codes, scales), want)
+    got = gemv.mxfp8_gemv(x, weight, block_scales, config=gemv.GemvConfig(5, 3, 3))
+    assert ((got.double() - want).abs() <= bound).all()
+
+    # Persistent split-K partials across distinct inputs and graph replay.
+    n, k, rows = 1792, 5120, 48
+    codes, scales = _weight(n, k, 112, 122, seed=6)
+    weight, block_scales = gemv.pack_weight(codes, scales)
+    work = gemv.max_partials_size(n, k, weight.device)
+    partials = (
+        torch.empty(work, dtype=torch.float32, device=DEVICE) if work > 0 else None
+    )
+    x = torch.randn(rows, k, device=DEVICE).to(torch.bfloat16)
+    out = torch.empty(rows, n, dtype=torch.bfloat16, device=DEVICE)
+    gemv.mxfp8_gemv(x, weight, block_scales, out=out, partials=partials)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        gemv.mxfp8_gemv(x, weight, block_scales, out=out, partials=partials)
+    for seed in (10, 11):
+        g = torch.Generator(device=DEVICE).manual_seed(seed)
+        x.copy_(torch.randn(rows, k, device=DEVICE, generator=g).to(torch.bfloat16))
+        out.zero_()
+        graph.replay()
+        assert torch.equal(out, gemv.mxfp8_gemv(x, weight, block_scales))
+
+
+def test_regstream_config_scales_with_sm_count(monkeypatch):
+    """SM90+ register-streaming config selection adapts to device SM count
+    and uses strictly less shared memory than the SM80 weight-SMEM kernel."""
+    from vllm.models.deepseek_v41.nvidia.specialized_decode.ampere import gemv
+
+    def pick(sms: int, n: int, k: int, x_tiles: int) -> gemv.GemvConfig:
+        monkeypatch.setattr(gemv, "_device_limits", lambda _idx: (sms, 232448))
+        gemv._regstream_config.cache_clear()
+        return gemv._regstream_config(n, k, x_tiles, 0)
+
+    try:
+        for sms in (78, 132):
+            for n, k in SHAPES:
+                for x_tiles in (1, 6):
+                    cfg = pick(sms, n, k, x_tiles)
+                    reg_k = gemv.RegStreamPdlMxfp8Gemv(n, k, x_tiles, cfg)
+                    amp_k = gemv.Mxfp8Gemv(n, k, x_tiles, cfg)
+                    assert reg_k.smem_bytes() < amp_k.smem_bytes()
+                    assert reg_k.smem_bytes() <= 232448
+        # K=288 (9 groups) uses non-power-of-two warps_k=3 on both 78 and 132 SMs.
+        assert pick(78, 5120, 288, 1).warps_k == 3
+        assert pick(132, 5120, 288, 1).warps_k == 3
+        # Larger SM count launches more CTAs rather than pinning to 78-SM tuning.
+        cfg_78 = pick(78, 5120, 1024, 1)
+        cfg_132 = pick(132, 5120, 1024, 1)
+        ctas_78 = (5120 // gemv.TILE_ROWS // cfg_78.warps_n) * cfg_78.splits(1024)
+        ctas_132 = (5120 // gemv.TILE_ROWS // cfg_132.warps_n) * cfg_132.splits(1024)
+        assert ctas_132 > ctas_78
+    finally:
+        gemv._regstream_config.cache_clear()
