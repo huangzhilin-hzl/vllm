@@ -1,0 +1,16 @@
+tests/models/deepseek_v41/nvidia/specialized_decode/ampere/test_gemv.py
+  h_65d95dfcbf63bf 205-208,211-237
+vllm/models/deepseek_v41/nvidia/specialized_decode/ampere/gemv.py
+  h_65d95dfcbf63bf 937-938,1005,1008
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8d308ef9b2a53d4abd62990446f537234261c2aa",
+  "prompts": {},
+  "humans": {
+    "h_65d95dfcbf63bf": {
+      "author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    }
+  }
+}
