@@ -788,7 +788,7 @@ def test_dsv4_fast_topk_bias_vl():
     not is_cutedsl_dsv4_topk_available(),
     reason="CuTe-DSL dsv4_topk requires CUDA SM80+ with cutlass.cute.",
 )
-@pytest.mark.parametrize("num_tokens", [17, 300])
+@pytest.mark.parametrize("num_tokens", [17, 1024])
 @pytest.mark.parametrize("num_experts", [256, 384])
 @pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("has_padding", [False, True])
@@ -865,7 +865,7 @@ def test_dsv4_topk_cutedsl_matches_triton_bit_exact(
     not is_cutedsl_dsv4_topk_available(),
     reason="CuTe-DSL dsv4_topk requires CUDA SM80+ with cutlass.cute.",
 )
-@pytest.mark.parametrize("num_tokens", [17, 300])
+@pytest.mark.parametrize("num_tokens", [17, 1024])
 @pytest.mark.parametrize("num_experts", [256, 384])
 def test_dsv4_topk_cutedsl_ties_and_neg_inf_parity(
     num_tokens: int,
