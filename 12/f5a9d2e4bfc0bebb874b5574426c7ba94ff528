@@ -1,0 +1,18 @@
+tests/kernels/moe/test_topk_softplus_sqrt.py
+  h_65d95dfcbf63bf 15-19,785-861
+vllm/model_executor/layers/fused_moe/router/dsv4_topk.py
+  h_65d95dfcbf63bf 4-5,11-12,14-35,174-219
+vllm/model_executor/layers/fused_moe/router/dsv4_topk_cutedsl.py
+  h_65d95dfcbf63bf 1-695
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "12f5a9d2e4bfc0bebb874b5574426c7ba94ff528",
+  "prompts": {},
+  "humans": {
+    "h_65d95dfcbf63bf": {
+      "author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    }
+  }
+}
