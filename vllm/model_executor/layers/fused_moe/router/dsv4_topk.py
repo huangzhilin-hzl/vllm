@@ -1,12 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
+
 import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
+logger = logging.getLogger(__name__)
+
 _TOPK = 6
+_cutedsl_available: bool | None = None
+
+
+def is_cutedsl_dsv4_topk_available() -> bool:
+    """Return True when CuTe-DSL `dsv4_topk` can run on the active device."""
+    global _cutedsl_available
+    if _cutedsl_available is not None:
+        return _cutedsl_available
+    if not (current_platform.is_cuda() and current_platform.has_device_capability(80)):
+        _cutedsl_available = False
+        return False
+    try:
+        import cuda.bindings.driver  # noqa: F401
+        import cutlass  # noqa: F401
+        import cutlass.cute  # noqa: F401
+
+        _cutedsl_available = True
+    except ImportError:
+        _cutedsl_available = False
+        logger.info("CuTe-DSL not available; dsv4_topk falls back to Triton.")
+    return _cutedsl_available
+
 
 # Adapted from:
 # https://github.com/sgl-project/sglang/blob/main/python/sglang/jit_kernel/moe_fused_gate.py
@@ -145,6 +171,52 @@ def dsv4_topk(
         assert bias_vl.dtype == torch.float32 and bias_vl.is_contiguous()
         assert bias_vl.shape == (num_experts,)
         assert input_ids.is_contiguous()
+    if (
+        is_cutedsl_dsv4_topk_available()
+        and num_experts in (256, 384)
+        and (
+            not has_vl
+            or (input_ids is not None and input_ids.dtype in (torch.int32, torch.int64))
+        )
+    ):
+        from vllm.model_executor.layers.fused_moe.router.dsv4_topk_cutedsl import (
+            dsv4_topk_cutedsl,
+        )
+
+        return dsv4_topk_cutedsl(
+            gating_output,
+            correction_bias,
+            indices_dtype,
+            routed_scaling_factor,
+            is_padding=is_padding,
+            input_ids=input_ids,
+            bias_vl=bias_vl,
+            image_sentinel_lo=image_sentinel_lo,
+        )
+    return _dsv4_topk_triton(
+        gating_output,
+        correction_bias,
+        indices_dtype,
+        routed_scaling_factor,
+        is_padding=is_padding,
+        input_ids=input_ids,
+        bias_vl=bias_vl,
+        image_sentinel_lo=image_sentinel_lo,
+    )
+
+
+def _dsv4_topk_triton(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    indices_dtype: torch.dtype,
+    routed_scaling_factor: float,
+    is_padding: torch.Tensor | None = None,
+    input_ids: torch.Tensor | None = None,
+    bias_vl: torch.Tensor | None = None,
+    image_sentinel_lo: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_tokens, num_experts = gating_output.shape
+    has_vl = bias_vl is not None and image_sentinel_lo > 0
     shape = (num_tokens, _TOPK)
     topk_weights = gating_output.new_empty(shape, dtype=torch.float32)
     topk_ids = gating_output.new_empty(shape, dtype=indices_dtype)

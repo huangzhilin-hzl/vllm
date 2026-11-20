@@ -12,7 +12,11 @@ from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
     get_routing_method_type,
 )
-from vllm.model_executor.layers.fused_moe.router.dsv4_topk import dsv4_topk
+from vllm.model_executor.layers.fused_moe.router.dsv4_topk import (
+    _dsv4_topk_triton,
+    dsv4_topk,
+    is_cutedsl_dsv4_topk_available,
+)
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
 )
@@ -778,3 +782,80 @@ def test_dsv4_fast_topk_bias_vl():
     assert topk_ids.dtype == torch.int64
     torch.testing.assert_close(topk_ids_ref.to(torch.int64), topk_ids, atol=0, rtol=0)
     torch.testing.assert_close(topk_weights_ref, topk_weights, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.skipif(
+    not is_cutedsl_dsv4_topk_available(),
+    reason="CuTe-DSL dsv4_topk requires CUDA SM80+ with cutlass.cute.",
+)
+@pytest.mark.parametrize("num_tokens", [17, 300])
+@pytest.mark.parametrize("num_experts", [256, 384])
+@pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("has_padding", [False, True])
+@pytest.mark.parametrize("vl_input_dtype", [None, torch.int32, torch.int64])
+def test_dsv4_topk_cutedsl_matches_triton_bit_exact(
+    num_tokens: int,
+    num_experts: int,
+    indices_dtype: torch.dtype,
+    has_padding: bool,
+    vl_input_dtype: torch.dtype | None,
+):
+    """Verify CuTe-DSL dsv4_topk matches Triton bit-for-bit across both warp paths."""
+    torch.manual_seed(42)
+    gating_output = torch.randn(
+        (num_tokens, num_experts), dtype=torch.float32, device="cuda"
+    )
+    correction_bias = torch.randn(num_experts, dtype=torch.float32, device="cuda")
+
+    # Edge cases: ties, -0.0/+0.0 ties, softplus >20 cutoff, zero sum, NaN.
+    gating_output[0] = 0.0
+    gating_output[1] = -0.0
+    gating_output[1, ::2] = 0.0
+    gating_output[2] = torch.linspace(19.0, 25.0, num_experts, device="cuda")
+    gating_output[3] = -100.0
+    gating_output[4, ::3] = float("nan")
+
+    is_padding = (
+        (torch.arange(num_tokens, device="cuda") % 3 == 2) if has_padding else None
+    )
+    if is_padding is not None:
+        gating_output[is_padding] = float("nan")
+
+    input_ids = None
+    bias_vl = None
+    image_sentinel_lo = 0
+    if vl_input_dtype is not None:
+        image_sentinel_lo = 120
+        input_ids = _make_mixed_input_ids(num_tokens, image_sentinel_lo).to(
+            vl_input_dtype
+        )
+        bias_vl = torch.randn(num_experts, dtype=torch.float32, device="cuda")
+
+    ref_w, ref_ids = _dsv4_topk_triton(
+        gating_output,
+        correction_bias,
+        indices_dtype,
+        1.75,
+        is_padding=is_padding,
+        input_ids=input_ids,
+        bias_vl=bias_vl,
+        image_sentinel_lo=image_sentinel_lo,
+    )
+    from vllm.model_executor.layers.fused_moe.router.dsv4_topk_cutedsl import (
+        dsv4_topk_cutedsl,
+    )
+
+    out_w, out_ids = dsv4_topk_cutedsl(
+        gating_output,
+        correction_bias,
+        indices_dtype,
+        1.75,
+        is_padding=is_padding,
+        input_ids=input_ids,
+        bias_vl=bias_vl,
+        image_sentinel_lo=image_sentinel_lo,
+    )
+
+    assert out_ids.dtype == indices_dtype
+    torch.testing.assert_close(out_ids, ref_ids, atol=0, rtol=0)
+    torch.testing.assert_close(out_w, ref_w, atol=0, rtol=0)
