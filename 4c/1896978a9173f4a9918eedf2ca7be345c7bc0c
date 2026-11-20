@@ -1,0 +1,14 @@
+.buildkite/test_areas/kernels.yaml
+  h_65d95dfcbf63bf 1025-1043
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4c1896978a9173f4a9918eedf2ca7be345c7bc0c",
+  "prompts": {},
+  "humans": {
+    "h_65d95dfcbf63bf": {
+      "author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    }
+  }
+}
