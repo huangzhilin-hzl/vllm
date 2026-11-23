@@ -1,0 +1,18 @@
+.buildkite/test_areas/kernels.yaml
+  h_65d95dfcbf63bf 1003-1005,1010
+tests/kernels/moe/test_topk_softplus_sqrt.py
+  h_65d95dfcbf63bf 5-6,957-970,975-976,978,984,993,997-1039,1044-1046
+vllm/model_executor/layers/fused_moe/router/dsv4_topk_cutedsl.py
+  h_65d95dfcbf63bf 513
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "bb6e9eac59ca71801d64a57566cca13350255fb0",
+  "prompts": {},
+  "humans": {
+    "h_65d95dfcbf63bf": {
+      "author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    }
+  }
+}
