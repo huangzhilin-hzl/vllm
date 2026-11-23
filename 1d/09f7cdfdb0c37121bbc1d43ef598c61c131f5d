@@ -1,0 +1,42 @@
+vllm/model_executor/layers/fused_moe/router/dsv4_topk_cutedsl.py
+  s_d808e19358c417::t_45204b7566deba 5-6,26,32,37-43,128,310-311,364-366,402,406-415,436,439-440,442,444,466,563-564,568-576,581-582,584,589-590,592,595,598,604-605,607-608,610-612,615,624-626,633,635-641,646-655,728
+  h_65d95dfcbf63bf 1-4,7-25,27-31,44-114,132-139,141-309,312-363,367-401,403-405,416-435,437-438,441,443,445-465,467-562,565-567,577-580,583,585-588,591,593,596-597,599-603,606,609,613-614,616-623,627-632,634,642-645,656-726,729-735,737-742,744,749-760,762-763
+  s_d808e19358c417::t_dac4439fc4e01f 33-36
+  h_65d95dfcbf63bf 115-127,129-131,140,594,727,736,743,745-748,761
+vllm/model_executor/layers/fused_moe/router/dsv4_topk.py
+  s_3b38c271b4709c::t_866f8cc5795378 5,17-18,24,27-41,125,128-130,138,186-192,195-203
+  h_65d95dfcbf63bf 4,6,12-13,16,19-23,25-26,42,185,193-194,204-243
+  h_65d95dfcbf63bf 43
+tests/kernels/moe/test_topk_softplus_sqrt.py
+  h_65d95dfcbf63bf 15-19,785-861,868
+  h_65d95dfcbf63bf 862-867,869-1031
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1d09f7cdfdb0c37121bbc1d43ef598c61c131f5d",
+  "prompts": {},
+  "humans": {
+    "h_65d95dfcbf63bf": {
+      "author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    }
+  },
+  "sessions": {
+    "s_3b38c271b4709c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a15da0-80b6-74f3-addd-a4bd4ccfe97d",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    },
+    "s_d808e19358c417": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1f925-b966-7301-ae8f-507a01de61d3",
+        "model": "gpt-6.2-sol"
+      },
+      "human_author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    }
+  }
+}
