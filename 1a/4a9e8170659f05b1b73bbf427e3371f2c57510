@@ -1,0 +1,29 @@
+tests/kernels/moe/test_topk_softplus_sqrt.py
+  s_76701910416f0d::t_227e5f80d510ef 791,868
+vllm/model_executor/layers/fused_moe/router/dsv4_topk_cutedsl.py
+  s_d808e19358c417::t_45204b7566deba 5-9,26,36-42,309-310,353-355,391,395-404,425,428-429,431,433,450,455-457,462-463,465,467,469,474-475,477-478,480-482,485,523-524,528-536,541-542,544,549-550,552,555,558,564-565,567-568,570-572,575,584-586,593,595-601,606-615,687
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1a4a9e8170659f05b1b73bbf427e3371f2c57510",
+  "prompts": {},
+  "sessions": {
+    "s_76701910416f0d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1f90a-9c47-74a3-a7cd-76eb6aa4da89",
+        "model": "gpt-6.2-sol"
+      },
+      "human_author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    },
+    "s_d808e19358c417": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1f925-b966-7301-ae8f-507a01de61d3",
+        "model": "gpt-6.2-sol"
+      },
+      "human_author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    }
+  }
+}

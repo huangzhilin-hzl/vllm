@@ -1,0 +1,19 @@
+vllm/model_executor/layers/fused_moe/router/dsv4_topk.py
+  s_3b38c271b4709c::t_866f8cc5795378 5,17-18,24,27-41,125,128-130,138,186-192,195-203
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0f49901f4e3c913bdf0d5fa977aa4d40ba6dc725",
+  "prompts": {},
+  "sessions": {
+    "s_3b38c271b4709c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a15da0-80b6-74f3-addd-a4bd4ccfe97d",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    }
+  }
+}
