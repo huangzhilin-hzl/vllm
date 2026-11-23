@@ -4,9 +4,9 @@
 
 Uses a 4-warp (128-thread) two-stage `warp_redux_sync` kernel when the token
 count is below the GPU's warp-scheduler saturation point
-(`M <= 4 * sm_count`) to maximize per-token parallelism, and a 1-warp
-(32-thread) zero-SMEM, zero-barrier `warp_redux_sync` kernel for larger
-prefill/mixed batches where CTAs already saturate the GPU.
+(`M <= 4 * sm_count`) to maximize per-token parallelism, and a packed
+1-warp-per-token (4 tokens/CTA, zero-barrier, SMEM-staged score) kernel for
+larger prefill/mixed batches to reach 100% SM warp occupancy.
 """
 
 from functools import cache
@@ -24,6 +24,7 @@ from vllm.platforms import current_platform
 
 _TOPK = 6
 _WARP_SCHEDULERS_PER_SM = 4
+_SINGLE_WARP_TOKENS_PER_CTA = 4
 _SUPPORTED_NUM_EXPERTS = (256, 384)
 _SmemAllocator = getattr(cutlass, "memory", cutlass.utils).SmemAllocator
 
@@ -308,6 +309,8 @@ class _Dsv4TopkCutlass:
         self.threads = num_warps * 32
         self.experts_per_thread = num_experts // self.threads
         self.num_merge_candidates = num_warps * _TOPK
+        self.single_warp_threads = _SINGLE_WARP_TOKENS_PER_CTA * 32
+        self.single_warp_smem_elems = _SINGLE_WARP_TOKENS_PER_CTA * num_experts
         self.has_padding = has_padding
         self.has_vl = has_vl
         self.input_ids_is_int64 = input_ids_is_int64
@@ -325,11 +328,17 @@ class _Dsv4TopkCutlass:
         input_ids: Int64,
         bias_vl: Int64,
         num_tokens: Int32,
+        grid_x: Int32,
         image_sentinel_lo: Int32,
         routed_scaling_factor: Float32,
         stream: cuda.CUstream,
     ):
         if cutlass.const_expr(self.num_warps == 1):
+
+            @cute.struct
+            class ScoreStorage:
+                scores: cute.struct.MemRange[Float32, self.single_warp_smem_elems]
+
             self.single_warp_kernel(
                 gating_output,
                 correction_bias,
@@ -338,11 +347,13 @@ class _Dsv4TopkCutlass:
                 topk_ids,
                 input_ids,
                 bias_vl,
+                num_tokens,
                 image_sentinel_lo,
                 routed_scaling_factor,
+                ScoreStorage,
             ).launch(
-                grid=(num_tokens, 1, 1),
-                block=[32, 1, 1],
+                grid=(grid_x, 1, 1),
+                block=[self.single_warp_threads, 1, 1],
                 stream=stream,
                 use_pdl=self.use_pdl,
             )
@@ -366,7 +377,7 @@ class _Dsv4TopkCutlass:
                 routed_scaling_factor,
                 Storage,
             ).launch(
-                grid=(num_tokens, 1, 1),
+                grid=(grid_x, 1, 1),
                 block=[self.threads, 1, 1],
                 stream=stream,
                 use_pdl=self.use_pdl,
@@ -442,65 +453,94 @@ class _Dsv4TopkCutlass:
         topk_ids: Int64,
         input_ids: Int64,
         bias_vl: Int64,
+        num_tokens: Int32,
         image_sentinel_lo: Int32,
         routed_scaling_factor: Float32,
+        ScoreStorage: cutlass.Constexpr,
     ):
-        lane, _, _ = cute.arch.thread_idx()
-        row, _, _ = cute.arch.block_idx()
+        tid, _, _ = cute.arch.thread_idx()
+        bx, _, _ = cute.arch.block_idx()
+        warp = tid // 32
+        lane = tid % 32
+        row = bx * _SINGLE_WARP_TOKENS_PER_CTA + warp
         experts_per_thread = self.experts_per_thread
 
-        bias_ptr = self._select_bias_ptr(
-            correction_bias, input_ids, bias_vl, row, image_sentinel_lo
+        smem = _SmemAllocator()
+        storage = smem.allocate(ScoreStorage)
+        smem_scores = storage.scores.get_tensor(
+            cute.make_layout(self.single_warp_smem_elems)
         )
-        expert_bias = cute.make_rmem_tensor(experts_per_thread, Float32)
-        for j in cutlass.range_constexpr(experts_per_thread):
-            expert_bias[j] = _load_f32_nc(bias_ptr + Int64(j * 32 + lane) * 4)
+        warp_offset = warp * self.num_experts
+
+        bias_ptr = correction_bias
+        if cutlass.const_expr(self.has_vl):  # noqa: SIM102
+            if row < num_tokens:
+                bias_ptr = self._select_bias_ptr(
+                    correction_bias, input_ids, bias_vl, row, image_sentinel_lo
+                )
 
         if cutlass.const_expr(self.use_pdl):
             cute.arch.griddepcontrol_wait()
 
-        score = cute.make_rmem_tensor(experts_per_thread, Float32)
-        key = cute.make_rmem_tensor(experts_per_thread, Uint32)
-        row_base = gating_output + Int64(row) * (self.num_experts * 4)
-        for j in cutlass.range_constexpr(experts_per_thread):
-            logit = _load_f32_ordered(row_base + Int64(j * 32 + lane) * 4)
-            score[j], key[j] = _score_and_key(logit, expert_bias[j])
-
-        best_key, best_local_idx = self._find_best_local(key)
-
         slot_weight = Float32(0.0)
         slot_id = Int32(0)
-        for slot in cutlass.range_constexpr(_TOPK):
-            top = cute.arch.warp_redux_sync(best_key, "umax")
-            tied_expert_id = Uint32(0xFFFFFFFF)
-            if best_key == top:
-                tied_expert_id = Uint32(lane + 32 * best_local_idx)
-            winner = Int32(cute.arch.warp_redux_sync(tied_expert_id, "umin"))
-            won = Float32(0.0)
-            if winner == lane + 32 * best_local_idx:
-                for j in cutlass.range_constexpr(experts_per_thread):
-                    if best_local_idx == j:
-                        won = score[j]
-                        key[j] = Uint32(0)
-                best_key, best_local_idx = self._find_best_local(key)
-            weight = cute.arch.shuffle_sync(won, winner & 31)
-            if lane == slot:
-                slot_weight = weight
-                slot_id = winner
+        if row < num_tokens:
+            row_base = gating_output + Int64(row) * (self.num_experts * 4)
+            key = cute.make_rmem_tensor(experts_per_thread, Uint32)
+            for chunk in cutlass.range_constexpr(experts_per_thread // 4):
+                j0 = chunk * 4
+                b0 = _load_f32_nc(bias_ptr + Int64((j0 + 0) * 32 + lane) * 4)
+                b1 = _load_f32_nc(bias_ptr + Int64((j0 + 1) * 32 + lane) * 4)
+                b2 = _load_f32_nc(bias_ptr + Int64((j0 + 2) * 32 + lane) * 4)
+                b3 = _load_f32_nc(bias_ptr + Int64((j0 + 3) * 32 + lane) * 4)
+                x0 = _load_f32_ordered(row_base + Int64((j0 + 0) * 32 + lane) * 4)
+                x1 = _load_f32_ordered(row_base + Int64((j0 + 1) * 32 + lane) * 4)
+                x2 = _load_f32_ordered(row_base + Int64((j0 + 2) * 32 + lane) * 4)
+                x3 = _load_f32_ordered(row_base + Int64((j0 + 3) * 32 + lane) * 4)
+                s0, k0 = _score_and_key(x0, b0)
+                s1, k1 = _score_and_key(x1, b1)
+                s2, k2 = _score_and_key(x2, b2)
+                s3, k3 = _score_and_key(x3, b3)
+                smem_scores[warp_offset + (j0 + 0) * 32 + lane] = s0
+                smem_scores[warp_offset + (j0 + 1) * 32 + lane] = s1
+                smem_scores[warp_offset + (j0 + 2) * 32 + lane] = s2
+                smem_scores[warp_offset + (j0 + 3) * 32 + lane] = s3
+                key[j0 + 0] = k0
+                key[j0 + 1] = k1
+                key[j0 + 2] = k2
+                key[j0 + 3] = k3
+
+            best_key, best_local_idx = self._find_best_local(key)
+
+            for slot in cutlass.range_constexpr(_TOPK):
+                top = cute.arch.warp_redux_sync(best_key, "umax")
+                tied_expert_id = Uint32(0xFFFFFFFF)
+                if best_key == top:
+                    tied_expert_id = Uint32(lane + 32 * best_local_idx)
+                winner = Int32(cute.arch.warp_redux_sync(tied_expert_id, "umin"))
+                if winner == lane + 32 * best_local_idx:
+                    for j in cutlass.range_constexpr(experts_per_thread):
+                        if best_local_idx == j:
+                            key[j] = Uint32(0)
+                    best_key, best_local_idx = self._find_best_local(key)
+                if lane == slot:
+                    slot_weight = smem_scores[warp_offset + winner]
+                    slot_id = winner
 
         if cutlass.const_expr(self.use_pdl):
             cute.arch.griddepcontrol_launch_dependents()
 
-        self._normalize_and_store(
-            slot_weight,
-            slot_id,
-            routed_scaling_factor,
-            is_padding,
-            topk_weights,
-            topk_ids,
-            row,
-            lane,
-        )
+        if row < num_tokens:
+            self._normalize_and_store(
+                slot_weight,
+                slot_id,
+                routed_scaling_factor,
+                is_padding,
+                topk_weights,
+                topk_ids,
+                row,
+                lane,
+            )
 
     @cute.kernel
     def multi_warp_kernel(
@@ -653,6 +693,7 @@ def _compiled_dsv4_topk(
             ),
             *(Int64(0),) * 7,
             Int32(1),
+            Int32(1),
             Int32(0),
             Float32(1.0),
             make_fake_stream(),
@@ -685,6 +726,12 @@ def dsv4_topk_cutedsl(
     if num_tokens > 0:
         device_index = gating_output.device.index
         num_warps = 4 if num_tokens <= _multi_warp_max_tokens(device_index) else 1
+        grid_x = (
+            (num_tokens + _SINGLE_WARP_TOKENS_PER_CTA - 1)
+            // _SINGLE_WARP_TOKENS_PER_CTA
+            if num_warps == 1
+            else num_tokens
+        )
         compiled = _compiled_dsv4_topk(
             device_index=device_index,
             num_experts=num_experts,
@@ -708,6 +755,7 @@ def dsv4_topk_cutedsl(
             Int64(input_ids.data_ptr() if has_vl and input_ids is not None else 0),
             Int64(bias_vl.data_ptr() if has_vl and bias_vl is not None else 0),
             Int32(num_tokens),
+            Int32(grid_x),
             Int32(image_sentinel_lo),
             Float32(routed_scaling_factor),
             cuda.CUstream(stream_handle),
