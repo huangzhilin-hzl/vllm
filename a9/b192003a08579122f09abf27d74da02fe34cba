@@ -1,0 +1,16 @@
+tests/models/deepseek_v41/nvidia/specialized_decode/ampere/test_gemv.py
+  h_65d95dfcbf63bf 22,205,214-215,217-218,220-221,223-224,234-235
+vllm/models/deepseek_v41/nvidia/specialized_decode/ampere/gemv.py
+  h_65d95dfcbf63bf 47,590,874,890-896,937,940,959,967,969,983-984,991-992,995,1006,1008,1038-1039,1042,1104-1105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a9b192003a08579122f09abf27d74da02fe34cba",
+  "prompts": {},
+  "humans": {
+    "h_65d95dfcbf63bf": {
+      "author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    }
+  }
+}
