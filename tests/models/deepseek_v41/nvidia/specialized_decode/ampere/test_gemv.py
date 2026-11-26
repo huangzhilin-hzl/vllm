@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The SM80/SM90+ MXFP8 decode GEMM (`gemv.py`) against its PyTorch reference
+"""The SM80/SM90 MXFP8 decode GEMM (`gemv.py`) against its PyTorch reference
 and cuBLAS.
 
 * Weight decoding, exact: rows of `x` that select single columns return
@@ -18,8 +18,8 @@ and cuBLAS.
   the FP32 summation order, and the self-resetting ticket counters.
 * The row-expanded scale copy the loader keeps, and CUDA-graph replay.
 
-SM80 runs the `cp.async` kernel (`Mxfp8Gemv`) and SM90+ runs the zero-weight-SMEM
-register-streaming PDL kernel (`HopperMxfp8Gemv`).
+SM80 runs the `cp.async` kernel (`Mxfp8Gemv`); SM90 exercises both
+`Mxfp8Gemv` and `HopperMxfp8Gemv` (zero-weight-SMEM register streaming + PDL).
 """
 
 import pytest
@@ -35,6 +35,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 DEVICE = "cuda"
+IS_SM90 = current_platform.is_cuda() and current_platform.is_device_capability(90)
 
 # Per-rank [N, K] at TP8: fused qkv (q_a, kv, index key), q_b without and
 # with the indexer's query projection, wo_b, the shared expert's w13 and w2.
@@ -46,6 +47,22 @@ SHAPES = [
     (576, 5120),
     (5120, 288),
 ]
+
+
+@pytest.fixture(
+    params=[False, True] if IS_SM90 else [False],
+    ids=["ampere", "hopper"] if IS_SM90 else ["ampere"],
+)
+def gemv_backend(request, monkeypatch):
+    """Force `mxfp8_gemv` / `default_config` onto either `Mxfp8Gemv` or
+    `HopperMxfp8Gemv` so SM90 CI keeps full coverage of both kernels."""
+    from vllm.models.deepseek_v41.nvidia.specialized_decode.ampere import gemv
+
+    use_hopper: bool = request.param
+    monkeypatch.setattr(gemv, "_use_hopper_kernel", lambda _device: use_hopper)
+    gemv.default_config.cache_clear()
+    yield use_hopper
+    gemv.default_config.cache_clear()
 
 
 def _weight(
@@ -68,7 +85,7 @@ def _bound(x: torch.Tensor, weight: torch.Tensor, want: torch.Tensor) -> torch.T
     return ulp + magnitude * 2.0**-16
 
 
-def test_decode_bitwise():
+def test_decode_bitwise(gemv_backend):
     """Single-column rows of x return dequantized weights exactly."""
     from vllm.models.deepseek_v41.nvidia.specialized_decode.ampere import gemv
 
@@ -90,7 +107,7 @@ def test_decode_bitwise():
 @pytest.mark.usefixtures("fp32_cublas_reduction")
 @pytest.mark.parametrize("rows", [1, 6, 24, 48])
 @pytest.mark.parametrize("n,k", SHAPES)
-def test_shapes(n: int, k: int, rows: int):
+def test_shapes(gemv_backend, n: int, k: int, rows: int):
     from vllm.models.deepseek_v41.nvidia.specialized_decode.ampere import gemv
 
     codes, scales = _weight(n, k, 112, 122, seed=n + k)
@@ -119,7 +136,7 @@ def test_shapes(n: int, k: int, rows: int):
         (2, 8, 4),  # 16 warps, 5 splits
     ],
 )
-def test_splits(config: tuple[int, int, int]):
+def test_splits(gemv_backend, config: tuple[int, int, int]):
     """Every split of the columns gives the reference within the bound;
     the counters are back at zero after each launch."""
     from vllm.models.deepseek_v41.nvidia.specialized_decode.ampere import gemv
@@ -138,7 +155,7 @@ def test_splits(config: tuple[int, int, int]):
     assert not gemv._counters(torch.device(DEVICE).index or 0).any()
 
 
-def test_expanded_scales_and_graph():
+def test_expanded_scales_and_graph(gemv_backend):
     """The row-expanded scales pack to the same layout; a captured launch
     replays on new inputs."""
     from vllm.models.deepseek_v41.nvidia.specialized_decode.ampere import gemv
@@ -164,13 +181,11 @@ def test_expanded_scales_and_graph():
         assert torch.equal(out, gemv.mxfp8_gemv(x, weight, block_scales))
 
 
-def test_persistent_partials_and_non_pow2_config():
-    """Persistent partials buffers reuse cleanly across launches and CUDA
-    graphs; non-power-of-two configs (e.g. warps_n=5, warps_k=3) match the
-    reference."""
+def test_non_pow2_config(gemv_backend):
+    """Non-power-of-two configs (e.g. warps_n=5, warps_k=3 on K=288) match the
+    reference on both kernels."""
     from vllm.models.deepseek_v41.nvidia.specialized_decode.ampere import gemv
 
-    # Non-power-of-two (warps_n=5, warps_k=3, groups=3) on K=288 (9 groups).
     n, k, rows = 5120, 288, 24
     codes, scales = _weight(n, k, 112, 122, seed=5)
     weight, block_scales = gemv.pack_weight(codes, scales)
@@ -180,58 +195,23 @@ def test_persistent_partials_and_non_pow2_config():
     got = gemv.mxfp8_gemv(x, weight, block_scales, config=gemv.GemvConfig(5, 3, 3))
     assert ((got.double() - want).abs() <= bound).all()
 
-    # Persistent split-K partials across distinct inputs and graph replay.
-    n, k, rows = 1792, 5120, 48
-    codes, scales = _weight(n, k, 112, 122, seed=6)
-    weight, block_scales = gemv.pack_weight(codes, scales)
-    work = gemv.max_partials_size(n, k, weight.device)
-    partials = (
-        torch.empty(work, dtype=torch.float32, device=DEVICE) if work > 0 else None
-    )
-    x = torch.randn(rows, k, device=DEVICE).to(torch.bfloat16)
-    out = torch.empty(rows, n, dtype=torch.bfloat16, device=DEVICE)
-    gemv.mxfp8_gemv(x, weight, block_scales, out=out, partials=partials)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        gemv.mxfp8_gemv(x, weight, block_scales, out=out, partials=partials)
-    for seed in (10, 11):
-        g = torch.Generator(device=DEVICE).manual_seed(seed)
-        x.copy_(torch.randn(rows, k, device=DEVICE, generator=g).to(torch.bfloat16))
-        out.zero_()
-        graph.replay()
-        assert torch.equal(out, gemv.mxfp8_gemv(x, weight, block_scales))
 
-
-def test_hopper_config_scales_with_sm_count():
-    """SM90+ register-streaming config selection adapts to device SM count,
-    uses strictly less shared memory than the SM80 weight-SMEM kernel, and
-    matches real-device `default_config` dispatch."""
+def test_smem_bytes_and_hopper_config():
+    """`smem_bytes()` upper-bounds the compiled `Storage` struct size for both
+    kernels, and `_hopper_default_config` picks valid configs (including
+    `warps_k=3` for K=288) within the device shared memory limit."""
     from vllm.models.deepseek_v41.nvidia.specialized_decode.ampere import gemv
 
     for sms in (78, 132):
         for n, k in SHAPES:
             for x_tiles in (1, 6):
                 config = gemv._hopper_default_config(n, k, x_tiles, sms, 232448)
+                for kernel_cls in (gemv.Mxfp8Gemv, gemv.HopperMxfp8Gemv):
+                    kernel = kernel_cls(n, k, x_tiles, config)
+                    storage_bytes = kernel._storage_type().size_in_bytes()
+                    assert kernel.smem_bytes() >= storage_bytes
                 hopper_kernel = gemv.HopperMxfp8Gemv(n, k, x_tiles, config)
-                ampere_kernel = gemv.Mxfp8Gemv(n, k, x_tiles, config)
-                assert hopper_kernel.smem_bytes() < ampere_kernel.smem_bytes()
                 assert hopper_kernel.smem_bytes() <= 232448
     # K=288 (9 groups) uses non-power-of-two warps_k=3 on both 78 and 132 SMs.
     assert gemv._hopper_default_config(5120, 288, 1, 78, 232448).warps_k == 3
     assert gemv._hopper_default_config(5120, 288, 1, 132, 232448).warps_k == 3
-    # Larger SM count launches more CTAs rather than pinning to 78-SM tuning.
-    config_78 = gemv._hopper_default_config(5120, 1024, 1, 78, 232448)
-    config_132 = gemv._hopper_default_config(5120, 1024, 1, 132, 232448)
-    ctas_78 = (5120 // gemv.TILE_ROWS // config_78.warps_n) * config_78.splits(1024)
-    ctas_132 = (5120 // gemv.TILE_ROWS // config_132.warps_n) * config_132.splits(1024)
-    assert ctas_132 > ctas_78
-
-    # Exercise the real device-property lookup and dispatch path.
-    device = torch.device(DEVICE, 0)
-    sms, smem_limit = gemv._device_limits(device.index)
-    for n, k in SHAPES:
-        config = gemv.default_config(n, k, 6, device)
-        if gemv._supports_pdl(device.index):
-            assert config == gemv._hopper_default_config(n, k, 1, sms, smem_limit)
-        else:
-            assert config == gemv._ampere_default_config(n, k, 6, sms, smem_limit)

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""MXFP8 linear layers at decode batch sizes on SM80 and SM90+, in CuTe DSL.
+"""MXFP8 linear layers at decode batch sizes on SM80 and SM90, in CuTe DSL.
 
 DeepSeek-V4.1's dense projections are MXFP8: FP8 E4M3 weights `W [N, K]`
 with one UE8M0 scale (`2^(s - 127)`) per 32 x 32 weight block. Before SM100
@@ -44,12 +44,14 @@ columns: warp `(wn, wk)` the 16 rows of tile `wn` and the `groups`
 - On SM80 (`Mxfp8Gemv`), all copies are `cp.async` to shared memory, issued
   before any is used: first `x` and scale factors, then each warp's weight
   blocks, one copy group per block.
-- On SM90+ (`HopperMxfp8Gemv`), weights and scales bypass shared memory
-  and stream directly into a 2- or 3-stage register ring via ordered
-  `ld.global.cg.v4.u32` (preventing load sinking) and `ld.global.nc.u32`.
-  Hopper PDL (`use_pdl=True`) prefetches the first weight blocks before
-  `griddepcontrol_wait()` while the upstream producer is finishing `x`, and
-  launches dependent kernels once reduction begins.
+- On SM90 (`HopperMxfp8Gemv`), weights and scales bypass shared memory and
+  stream directly into a 2- or 3-stage register ring: weights via ordered
+  `ld.global.cg.v4.u32` (`has_side_effects=True`, preventing load sinking)
+  and scales via `ld.global.nc.u32`. Hopper PDL (`use_pdl=True`) prefetches
+  the initial weight blocks before `griddepcontrol_wait()` while the upstream
+  producer is finishing `x` (assuming weights are read-only relative to the
+  preceding kernel on the stream), and launches dependent kernels once
+  reduction begins.
 
 After the MMAs, the `warps_k` partial sums of each output meet in shared
 memory and are added in warp order. When the columns are split over `splits`
@@ -60,7 +62,7 @@ fixed: results are deterministic and do not depend on which CTA finishes
 last. The ticket counters reset themselves (CUDA-graph safe). By default a
 device's launches share one set, so they must be ordered on one stream at a
 time; a caller whose launches can overlap on several streams gives each
-weight its own counters (and optional persistent `partials` workspace).
+weight its own counters.
 
 `default_config` picks the split for a shape and device; `mxfp8_gemv` takes
 an explicit one too.
@@ -322,6 +324,9 @@ class Mxfp8Gemv:
     """`y = x . dequant(W)^T` for one weight shape and `x_tiles` x 8 rows
     of `x`; see the module docstring."""
 
+    _stage_weights = True
+    _use_pdl = False
+
     def __init__(self, n: int, k: int, x_tiles: int, config: GemvConfig):
         assert n % TILE_ROWS == 0 and k % GROUP == 0
         assert 1 <= x_tiles <= MAX_ROWS // X_TILE
@@ -346,17 +351,36 @@ class Mxfp8Gemv:
         words = self.cta_cols // 2
         self.row_words = words if words % 32 == 16 else words + 16
         self.x_words = self.x_rows * self.row_words
-        # Each warp's weight blocks follow the x tile.
-        self.w_words = self.threads // 32 * self.groups * (BLOCK_BYTES // 4)
-        # Scale rows the CTA's tiles touch (an odd first tile starts mid-row).
-        self.scale_rows = self.warps_n // 2 + 1
         # Partial sums [warps_k][x row][weight row], padded against conflicts;
-        # they reuse the x tile and weight space after the products.
+        # they reuse the x tile (and staged weights on SM80) after the products.
         self.red_stride = self.cta_rows + 4
-        self.buf_words = max(
-            self.x_words + self.w_words,
-            self.warps_k * self.x_rows * self.red_stride,
-        )
+        if self._stage_weights:
+            # Each warp's weight blocks follow the x tile.
+            self.w_words = self.threads // 32 * self.groups * (BLOCK_BYTES // 4)
+            # Scale rows the CTA's tiles touch (an odd first tile starts mid-row).
+            self.scale_rows = self.warps_n // 2 + 1
+            self.buf_words = max(
+                self.x_words + self.w_words,
+                self.warps_k * self.x_rows * self.red_stride,
+            )
+        else:
+            self.w_words = 0
+            self.scale_rows = 0
+            self.buf_words = max(
+                self.x_words,
+                self.warps_k * self.x_rows * self.red_stride,
+            )
+
+    def _storage_type(self):
+        @cute.struct
+        class Storage:
+            buf: cute.struct.Align[cute.struct.MemRange[Uint32, self.buf_words], 16]
+            scale: cute.struct.Align[
+                cute.struct.MemRange[Uint32, self.scale_rows * self.cta_groups], 16
+            ]
+            last: cute.struct.MemRange[Int32, 1]
+
+        return Storage
 
     def smem_bytes(self) -> int:
         """Shared memory of one CTA (alignment padding included)."""
@@ -376,57 +400,39 @@ class Mxfp8Gemv:
         y_stride: Int32,
         stream: cuda.CUstream,
     ):
-        @cute.struct
-        class Storage:
-            buf: cute.struct.Align[cute.struct.MemRange[Uint32, self.buf_words], 16]
-            scale: cute.struct.Align[
-                cute.struct.MemRange[Uint32, self.scale_rows * self.cta_groups], 16
-            ]
-            last: cute.struct.MemRange[Int32, 1]
-
-        self.kernel(
+        Storage = self._storage_type()
+        launch = self.kernel(
             weight, scales, x, y, partials, counters, rows, x_stride, y_stride, Storage
-        ).launch(
-            grid=(self.row_blocks, self.splits, 1),
-            block=[self.threads, 1, 1],
-            # cute.struct adds size_in_bytes to the class at runtime.
-            smem=Storage.size_in_bytes(),  # type: ignore[attr-defined]
-            stream=stream,
         )
+        if cutlass.const_expr(self._use_pdl):
+            launch.launch(
+                grid=(self.row_blocks, self.splits, 1),
+                block=[self.threads, 1, 1],
+                # cute.struct adds size_in_bytes to the class at runtime.
+                smem=Storage.size_in_bytes(),  # type: ignore[attr-defined]
+                stream=stream,
+                use_pdl=True,
+            )
+        else:
+            launch.launch(
+                grid=(self.row_blocks, self.splits, 1),
+                block=[self.threads, 1, 1],
+                # cute.struct adds size_in_bytes to the class at runtime.
+                smem=Storage.size_in_bytes(),  # type: ignore[attr-defined]
+                stream=stream,
+            )
 
-    @cute.kernel
-    def kernel(
+    @cute.jit
+    def _load_x(
         self,
-        weight: Int64,
-        scales: Int64,
+        x_base: Int32,
         x: Int64,
-        y: Int64,
-        partials: Int64,
-        counters: Int64,
         rows: Int32,
         x_stride: Int32,
-        y_stride: Int32,
-        Storage: cutlass.Constexpr,
+        split: Int32,
+        tid: Int32,
     ):
-        tid, _, _ = cute.arch.thread_idx()
-        block, split, _ = cute.arch.block_idx()
-        warp = tid // 32
-        lane = tid % 32
-        wn = warp % self.warps_n
-        wk = warp // self.warps_n
-        g = lane // 4
-        q = lane % 4
-        groups = self.groups
-        k_groups = self.k // GROUP
-        tile = block * self.warps_n + wn
-        first = split * self.cta_groups + wk * groups
-
-        smem = cutlass.utils.SmemAllocator()
-        storage = smem.allocate(Storage)
-        x_base = Int32(storage.buf.data_ptr().toint())
-        scale_base = Int32(storage.scale.data_ptr().toint())
-
-        # ---- copy group 0: the CTA's columns of x and its scale factors ----
+        """Issue `cp.async` copies of the CTA's columns of `x` into shared memory."""
         vectors = self.cta_cols // 8  # 16-byte vectors per row
         total = self.x_rows * vectors
         for it in cutlass.range_constexpr((total + self.threads - 1) // self.threads):
@@ -447,6 +453,157 @@ class Mxfp8Gemv:
                     )
                     size = Int32(16)
                 copy_async(x_base + (r * self.row_words + v * 4) * 4, source, size)
+
+    @cute.jit
+    def _decode_and_mma(
+        self,
+        raw: list,
+        scale: Uint32,
+        x_base: Int32,
+        acc: cute.Tensor,
+        column: Int32,
+        g: Int32,
+    ):
+        """Decode one 32-column block of weights and accumulate across `x_tiles`."""
+        a = []
+        for j in cutlass.range_constexpr(4):
+            even, odd = decode_pairs(raw[j], scale)
+            a.append(even)
+            a.append(odd)
+        for t in cutlass.range_constexpr(self.x_tiles):
+            b = load_shared(x_base + ((t * X_TILE + g) * self.row_words + column) * 4)
+            c = [acc[t, j] for j in range(4)]
+            c = mma_bf16(c, a[0:4], b[0:2])
+            c = mma_bf16(c, a[4:8], b[2:4])
+            for j in cutlass.range_constexpr(4):
+                acc[t, j] = c[j]
+
+    @cute.jit
+    def _epilogue(
+        self,
+        red: cute.Tensor,
+        last: cute.Tensor,
+        acc: cute.Tensor,
+        y: Int64,
+        partials: Int64,
+        counters: Int64,
+        rows: Int32,
+        y_stride: Int32,
+        tid: Int32,
+        block: Int32,
+        split: Int32,
+        wn: Int32,
+        wk: Int32,
+        g: Int32,
+        q: Int32,
+    ):
+        """Reduce `warps_k` partials in shared memory, then write BF16 or split-K
+        partials and run the deterministic ticket reduction when `splits > 1`."""
+        for t in cutlass.range_constexpr(self.x_tiles):
+            for j in cutlass.range_constexpr(4):
+                x_row = t * X_TILE + 2 * q + j % 2
+                red[wk, x_row, wn * TILE_ROWS + g + 8 * (j // 2)] = acc[t, j]
+        cute.arch.barrier()
+
+        quads = self.cta_rows // 4
+        total = self.x_rows * quads
+        trips = (total + self.threads - 1) // self.threads
+        n0 = block * self.cta_rows
+
+        if cutlass.const_expr(self._use_pdl and self.splits == 1):
+            cute.arch.griddepcontrol_launch_dependents()
+
+        for it in cutlass.range_constexpr(trips):
+            c = tid + it * self.threads
+            r = c // quads
+            v = (c % quads) * 4
+            if c < total and r < rows:
+                sums = [red[0, r, v + e] for e in range(4)]
+                for w in cutlass.range_constexpr(1, self.warps_k):
+                    for e in cutlass.range_constexpr(4):
+                        sums[e] = sums[e] + red[w, r, v + e]
+                if cutlass.const_expr(self.splits == 1):
+                    store_pair(
+                        y + (Int64(r) * Int64(y_stride) + Int64(n0 + v)) * 2,
+                        pack_bf16x2(sums[0], sums[1]),
+                        pack_bf16x2(sums[2], sums[3]),
+                    )
+                else:
+                    store_partials(
+                        partials
+                        + ((Int64(split) * self.x_rows + r) * self.n + Int64(n0 + v))
+                        * 4,
+                        sums,
+                    )
+
+        if cutlass.const_expr(self.splits > 1):
+            # The last CTA of the row block adds the splits' sums in split
+            # order. Every thread fences its stores before the barrier and
+            # thread 0's ticket; in the last CTA, the ticket's acquire, the
+            # barrier and each thread's fence order the other CTAs' sums
+            # before its reads.
+            fence_gpu()
+            cute.arch.barrier()
+            counter = counters + Int64(block) * 4
+            if tid == 0:
+                last[0] = Int32(0)
+                if ticket(counter) == Uint32(self.splits - 1):
+                    last[0] = Int32(1)
+            cute.arch.barrier()
+            if last[0] == 1:
+                if cutlass.const_expr(self._use_pdl):
+                    cute.arch.griddepcontrol_launch_dependents()
+                fence_gpu()
+                for it in cutlass.range_constexpr(trips):
+                    c = tid + it * self.threads
+                    r = c // quads
+                    v = (c % quads) * 4
+                    if c < total and r < rows:
+                        base = partials + (Int64(r) * self.n + Int64(n0 + v)) * 4
+                        loaded = [
+                            load_partials(base + Int64(s * self.x_rows * self.n * 4))
+                            for s in range(self.splits)
+                        ]
+                        sums = loaded[0]
+                        for s in cutlass.range_constexpr(1, self.splits):
+                            for e in cutlass.range_constexpr(4):
+                                sums[e] = sums[e] + loaded[s][e]
+                        store_pair(
+                            y + (Int64(r) * Int64(y_stride) + Int64(n0 + v)) * 2,
+                            pack_bf16x2(sums[0], sums[1]),
+                            pack_bf16x2(sums[2], sums[3]),
+                        )
+                if tid == 0:
+                    store_u32(counter, Uint32(0))
+
+    @cute.jit
+    def _accumulate(
+        self,
+        weight: Int64,
+        scales: Int64,
+        x: Int64,
+        x_base: Int32,
+        scale_base: Int32,
+        acc: cute.Tensor,
+        rows: Int32,
+        x_stride: Int32,
+        tid: Int32,
+        block: Int32,
+        split: Int32,
+        warp: Int32,
+        lane: Int32,
+        wk: Int32,
+        g: Int32,
+        q: Int32,
+        tile: Int32,
+        first: Int32,
+    ):
+        """SM80 mainloop: stage `x`, scales and weights into SMEM via `cp.async`."""
+        groups = self.groups
+        k_groups = self.k // GROUP
+
+        # ---- copy group 0: the CTA's columns of x and its scale factors ----
+        self._load_x(x_base, x, rows, x_stride, split, tid)
         # Factors [scale row - first scale row][CTA group].
         scale_row0 = block * self.warps_n // 2
         total = self.scale_rows * self.cta_groups
@@ -480,7 +637,6 @@ class Mxfp8Gemv:
         cute.arch.barrier()
 
         # ---- decode and multiply, one 32-column group at a time ----
-        acc = cute.make_rmem_tensor(cute.make_layout((self.x_tiles, 4)), Float32)
         acc.fill(0.0)
         scale_row = (tile // 2 - scale_row0) * self.cta_groups + wk * groups
         for i in cutlass.range_constexpr(groups):
@@ -488,151 +644,8 @@ class Mxfp8Gemv:
             cute.arch.cp_async_wait_group(groups - 1 - i)
             raw = load_shared(w_lane + i * BLOCK_BYTES)
             scale = load_shared_word(scale_base + (scale_row + i) * 4)
-            a = []
-            for j in cutlass.range_constexpr(4):
-                even, odd = decode_pairs(raw[j], scale)
-                a.append(even)
-                a.append(odd)
             column = (wk * groups + i) * 16 + q * 4
-            for t in cutlass.range_constexpr(self.x_tiles):
-                b = load_shared(
-                    x_base + ((t * X_TILE + g) * self.row_words + column) * 4
-                )
-                c = [acc[t, j] for j in range(4)]
-                c = mma_bf16(c, a[0:4], b[0:2])
-                c = mma_bf16(c, a[4:8], b[2:4])
-                for j in cutlass.range_constexpr(4):
-                    acc[t, j] = c[j]
-        cute.arch.barrier()
-
-        # ---- the warps' partial sums, [warps_k][x row][weight row] ----
-        red = storage.buf.get_tensor(
-            cute.make_layout(
-                (self.warps_k, self.x_rows, self.cta_rows),
-                stride=(self.x_rows * self.red_stride, self.red_stride, 1),
-            ),
-            dtype=Float32,
-        )
-        for t in cutlass.range_constexpr(self.x_tiles):
-            for j in cutlass.range_constexpr(4):
-                x_row = t * X_TILE + 2 * q + j % 2
-                red[wk, x_row, wn * TILE_ROWS + g + 8 * (j // 2)] = acc[t, j]
-        cute.arch.barrier()
-
-        # ---- add them in warp order; BF16 out, or this split's FP32 sums ----
-        quads = self.cta_rows // 4
-        total = self.x_rows * quads
-        trips = (total + self.threads - 1) // self.threads
-        n0 = block * self.cta_rows
-        for it in cutlass.range_constexpr(trips):
-            c = tid + it * self.threads
-            r = c // quads
-            v = (c % quads) * 4
-            if c < total and r < rows:
-                sums = [red[0, r, v + e] for e in range(4)]
-                for w in cutlass.range_constexpr(1, self.warps_k):
-                    for e in cutlass.range_constexpr(4):
-                        sums[e] = sums[e] + red[w, r, v + e]
-                if cutlass.const_expr(self.splits == 1):
-                    store_pair(
-                        y + (Int64(r) * Int64(y_stride) + Int64(n0 + v)) * 2,
-                        pack_bf16x2(sums[0], sums[1]),
-                        pack_bf16x2(sums[2], sums[3]),
-                    )
-                else:
-                    store_partials(
-                        partials
-                        + ((Int64(split) * self.x_rows + r) * self.n + Int64(n0 + v))
-                        * 4,
-                        sums,
-                    )
-
-        if cutlass.const_expr(self.splits > 1):
-            # The last CTA of the row block adds the splits' sums in split
-            # order. Every thread fences its stores before the barrier and
-            # thread 0's ticket; in the last CTA, the ticket's acquire, the
-            # barrier and each thread's fence order the other CTAs' sums
-            # before its reads.
-            last = storage.last.get_tensor(cute.make_layout(1))
-            fence_gpu()
-            cute.arch.barrier()
-            counter = counters + Int64(block) * 4
-            if tid == 0:
-                last[0] = Int32(0)
-                if ticket(counter) == Uint32(self.splits - 1):
-                    last[0] = Int32(1)
-            cute.arch.barrier()
-            if last[0] == 1:
-                fence_gpu()
-                for it in cutlass.range_constexpr(trips):
-                    c = tid + it * self.threads
-                    r = c // quads
-                    v = (c % quads) * 4
-                    if c < total and r < rows:
-                        base = partials + (Int64(r) * self.n + Int64(n0 + v)) * 4
-                        loaded = [
-                            load_partials(base + Int64(s * self.x_rows * self.n * 4))
-                            for s in range(self.splits)
-                        ]
-                        sums = loaded[0]
-                        for s in cutlass.range_constexpr(1, self.splits):
-                            for e in cutlass.range_constexpr(4):
-                                sums[e] = sums[e] + loaded[s][e]
-                        store_pair(
-                            y + (Int64(r) * Int64(y_stride) + Int64(n0 + v)) * 2,
-                            pack_bf16x2(sums[0], sums[1]),
-                            pack_bf16x2(sums[2], sums[3]),
-                        )
-                if tid == 0:
-                    store_u32(counter, Uint32(0))
-
-
-class HopperMxfp8Gemv(Mxfp8Gemv):
-    """Zero-weight-SMEM register-streaming MXFP8 GEMV with Hopper+ PDL.
-
-    Weights and scales bypass shared memory and stream into a 2- or 3-stage
-    register ring via ordered `ld.global.cg.v4.u32` and `ld.global.nc.u32`.
-    Initial weight blocks are prefetched before `griddepcontrol_wait()` so
-    weight-load latency overlaps with the upstream producer of `x`.
-    """
-
-    def __init__(self, n: int, k: int, x_tiles: int, config: GemvConfig):
-        super().__init__(n, k, x_tiles, config)
-        self.buf_words = max(self.x_words, self.warps_k * self.x_rows * self.red_stride)
-
-    def smem_bytes(self) -> int:
-        """Shared memory of one CTA (alignment padding included)."""
-        return (self.buf_words * 4 + 4 + 15) & ~15
-
-    @cute.jit
-    def __call__(
-        self,
-        weight: Int64,
-        scales: Int64,
-        x: Int64,
-        y: Int64,
-        partials: Int64,
-        counters: Int64,
-        rows: Int32,
-        x_stride: Int32,
-        y_stride: Int32,
-        stream: cuda.CUstream,
-    ):
-        @cute.struct
-        class Storage:
-            buf: cute.struct.Align[cute.struct.MemRange[Uint32, self.buf_words], 16]
-            last: cute.struct.MemRange[Int32, 1]
-
-        self.kernel(
-            weight, scales, x, y, partials, counters, rows, x_stride, y_stride, Storage
-        ).launch(
-            grid=(self.row_blocks, self.splits, 1),
-            block=[self.threads, 1, 1],
-            # cute.struct adds size_in_bytes to the class at runtime.
-            smem=Storage.size_in_bytes(),  # type: ignore[attr-defined]
-            stream=stream,
-            use_pdl=True,
-        )
+            self._decode_and_mma(raw, scale, x_base, acc, column, g)
 
     @cute.kernel
     def kernel(
@@ -656,14 +669,119 @@ class HopperMxfp8Gemv(Mxfp8Gemv):
         wk = warp // self.warps_n
         g = lane // 4
         q = lane % 4
-        groups = self.groups
-        k_groups = self.k // GROUP
         tile = block * self.warps_n + wn
-        first = split * self.cta_groups + wk * groups
+        first = split * self.cta_groups + wk * self.groups
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(Storage)
         x_base = Int32(storage.buf.data_ptr().toint())
+
+        acc = cute.make_rmem_tensor(cute.make_layout((self.x_tiles, 4)), Float32)
+        scale_base = Int32(0)
+        if cutlass.const_expr(self._stage_weights):
+            scale_base = Int32(storage.scale.data_ptr().toint())
+        self._accumulate(
+            weight,
+            scales,
+            x,
+            x_base,
+            scale_base,
+            acc,
+            rows,
+            x_stride,
+            tid,
+            block,
+            split,
+            warp,
+            lane,
+            wk,
+            g,
+            q,
+            tile,
+            first,
+        )
+        cute.arch.barrier()
+
+        red = storage.buf.get_tensor(
+            cute.make_layout(
+                (self.warps_k, self.x_rows, self.cta_rows),
+                stride=(self.x_rows * self.red_stride, self.red_stride, 1),
+            ),
+            dtype=Float32,
+        )
+        last = storage.last.get_tensor(cute.make_layout(1))
+        self._epilogue(
+            red,
+            last,
+            acc,
+            y,
+            partials,
+            counters,
+            rows,
+            y_stride,
+            tid,
+            block,
+            split,
+            wn,
+            wk,
+            g,
+            q,
+        )
+
+
+class HopperMxfp8Gemv(Mxfp8Gemv):
+    """Zero-weight-SMEM register-streaming MXFP8 GEMV with Hopper PDL (SM90).
+
+    Weights and scales bypass shared memory and stream into a 2- or 3-stage
+    register ring: weights via ordered `ld.global.cg.v4.u32`
+    (`has_side_effects=True`, preventing load sinking) and scales via
+    `ld.global.nc.u32`. Initial weight blocks are prefetched before
+    `griddepcontrol_wait()` so weight-load latency overlaps with the upstream
+    producer of `x` (assuming weights are read-only relative to the preceding
+    kernel on the stream).
+    """
+
+    _stage_weights = False
+    _use_pdl = True
+
+    def _storage_type(self):
+        @cute.struct
+        class Storage:
+            buf: cute.struct.Align[cute.struct.MemRange[Uint32, self.buf_words], 16]
+            last: cute.struct.MemRange[Int32, 1]
+
+        return Storage
+
+    def smem_bytes(self) -> int:
+        """Shared memory of one CTA (alignment padding included)."""
+        return (self.buf_words * 4 + 4 + 15) & ~15
+
+    @cute.jit
+    def _accumulate(
+        self,
+        weight: Int64,
+        scales: Int64,
+        x: Int64,
+        x_base: Int32,
+        scale_base: Int32,
+        acc: cute.Tensor,
+        rows: Int32,
+        x_stride: Int32,
+        tid: Int32,
+        block: Int32,
+        split: Int32,
+        warp: Int32,
+        lane: Int32,
+        wk: Int32,
+        g: Int32,
+        q: Int32,
+        tile: Int32,
+        first: Int32,
+    ):
+        """SM90 mainloop: prefetch weights/scales into a register ring before
+        PDL wait, stage only `x` in SMEM, and stream remaining blocks."""
+        groups = self.groups
+        k_groups = self.k // GROUP
 
         # Prefetch initial weight blocks and scales before waiting on producer.
         weight_base = (
@@ -672,48 +790,27 @@ class HopperMxfp8Gemv(Mxfp8Gemv):
             + Int64(lane) * LANE_BYTES
         )
         scale_row = tile // 2
-        scale_base = scales + (Int64(scale_row) * k_groups + Int64(first)) * 4
+        global_scale_base = scales + (Int64(scale_row) * k_groups + Int64(first)) * 4
         prefetch_stages = min(groups, 2 if self.x_tiles >= 4 else 3)
         weight_buffer = cute.make_rmem_tensor(
             cute.make_layout((prefetch_stages, 4)), Uint32
         )
         scale_buffer = cute.make_rmem_tensor(cute.make_layout(prefetch_stages), Uint32)
         for stage in cutlass.range_constexpr(prefetch_stages):
-            scale_buffer[stage] = load_u32(scale_base + Int64(stage) * 4)
+            scale_buffer[stage] = load_u32(global_scale_base + Int64(stage) * 4)
             loaded_weights = load_weights(weight_base + Int64(stage) * BLOCK_BYTES)
             for j in cutlass.range_constexpr(4):
                 weight_buffer[stage, j] = loaded_weights[j]
 
         cute.arch.griddepcontrol_wait()
 
-        # Copy CTA's columns of `x` into SMEM via cp.async with bank-conflict padding.
-        vectors = self.cta_cols // 8
-        total = self.x_rows * vectors
-        for it in cutlass.range_constexpr((total + self.threads - 1) // self.threads):
-            c = tid + it * self.threads
-            if c < total:
-                r = c // vectors
-                v = c % vectors
-                source = x
-                size = Int32(0)
-                if r < rows:
-                    source = (
-                        x
-                        + (
-                            Int64(r) * Int64(x_stride)
-                            + Int64(split * self.cta_cols + v * 8)
-                        )
-                        * 2
-                    )
-                    size = Int32(16)
-                copy_async(x_base + (r * self.row_words + v * 4) * 4, source, size)
+        # Copy the CTA's columns of `x` into shared memory via `cp.async`.
+        self._load_x(x_base, x, rows, x_stride, split, tid)
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
         cute.arch.barrier()
 
-        acc = cute.make_rmem_tensor(cute.make_layout((self.x_tiles, 4)), Float32)
         acc.fill(0.0)
-
         for i in cutlass.range_constexpr(groups):
             stage = i % prefetch_stages
             scale = scale_buffer[stage]
@@ -721,110 +818,17 @@ class HopperMxfp8Gemv(Mxfp8Gemv):
 
             if cutlass.const_expr(i + prefetch_stages < groups):
                 next_group = i + prefetch_stages
-                scale_buffer[stage] = load_u32(scale_base + Int64(next_group) * 4)
+                scale_buffer[stage] = load_u32(
+                    global_scale_base + Int64(next_group) * 4
+                )
                 loaded_weights = load_weights(
                     weight_base + Int64(next_group) * BLOCK_BYTES
                 )
                 for j in cutlass.range_constexpr(4):
                     weight_buffer[stage, j] = loaded_weights[j]
 
-            a = []
-            for j in cutlass.range_constexpr(4):
-                even, odd = decode_pairs(raw[j], scale)
-                a.append(even)
-                a.append(odd)
             column = (wk * groups + i) * 16 + q * 4
-            for t in cutlass.range_constexpr(self.x_tiles):
-                b = load_shared(
-                    x_base + ((t * X_TILE + g) * self.row_words + column) * 4
-                )
-                c = [acc[t, j] for j in range(4)]
-                c = mma_bf16(c, a[0:4], b[0:2])
-                c = mma_bf16(c, a[4:8], b[2:4])
-                for j in cutlass.range_constexpr(4):
-                    acc[t, j] = c[j]
-
-        cute.arch.barrier()
-
-        # Reduce across `warps_k` in SMEM, reusing the `x` buffer.
-        red = storage.buf.get_tensor(
-            cute.make_layout(
-                (self.warps_k, self.x_rows, self.cta_rows),
-                stride=(self.x_rows * self.red_stride, self.red_stride, 1),
-            ),
-            dtype=Float32,
-        )
-        for t in cutlass.range_constexpr(self.x_tiles):
-            for j in cutlass.range_constexpr(4):
-                x_row = t * X_TILE + 2 * q + j % 2
-                red[wk, x_row, wn * TILE_ROWS + g + 8 * (j // 2)] = acc[t, j]
-        cute.arch.barrier()
-
-        quads = self.cta_rows // 4
-        total = self.x_rows * quads
-        trips = (total + self.threads - 1) // self.threads
-        n0 = block * self.cta_rows
-
-        if cutlass.const_expr(self.splits == 1):
-            cute.arch.griddepcontrol_launch_dependents()
-
-        for it in cutlass.range_constexpr(trips):
-            c = tid + it * self.threads
-            r = c // quads
-            v = (c % quads) * 4
-            if c < total and r < rows:
-                sums = [red[0, r, v + e] for e in range(4)]
-                for w in cutlass.range_constexpr(1, self.warps_k):
-                    for e in cutlass.range_constexpr(4):
-                        sums[e] = sums[e] + red[w, r, v + e]
-                if cutlass.const_expr(self.splits == 1):
-                    store_pair(
-                        y + (Int64(r) * Int64(y_stride) + Int64(n0 + v)) * 2,
-                        pack_bf16x2(sums[0], sums[1]),
-                        pack_bf16x2(sums[2], sums[3]),
-                    )
-                else:
-                    store_partials(
-                        partials
-                        + ((Int64(split) * self.x_rows + r) * self.n + Int64(n0 + v))
-                        * 4,
-                        sums,
-                    )
-
-        if cutlass.const_expr(self.splits > 1):
-            last = storage.last.get_tensor(cute.make_layout(1))
-            fence_gpu()
-            cute.arch.barrier()
-            counter = counters + Int64(block) * 4
-            if tid == 0:
-                last[0] = Int32(0)
-                if ticket(counter) == Uint32(self.splits - 1):
-                    last[0] = Int32(1)
-            cute.arch.barrier()
-            if last[0] == 1:
-                cute.arch.griddepcontrol_launch_dependents()
-                fence_gpu()
-                for it in cutlass.range_constexpr(trips):
-                    c = tid + it * self.threads
-                    r = c // quads
-                    v = (c % quads) * 4
-                    if c < total and r < rows:
-                        base = partials + (Int64(r) * self.n + Int64(n0 + v)) * 4
-                        loaded = [
-                            load_partials(base + Int64(s * self.x_rows * self.n * 4))
-                            for s in range(self.splits)
-                        ]
-                        sums = loaded[0]
-                        for s in cutlass.range_constexpr(1, self.splits):
-                            for e in cutlass.range_constexpr(4):
-                                sums[e] = sums[e] + loaded[s][e]
-                        store_pair(
-                            y + (Int64(r) * Int64(y_stride) + Int64(n0 + v)) * 2,
-                            pack_bf16x2(sums[0], sums[1]),
-                            pack_bf16x2(sums[2], sums[3]),
-                        )
-                if tid == 0:
-                    store_u32(counter, Uint32(0))
+            self._decode_and_mma(raw, scale, x_base, acc, column, g)
 
 
 def pack_weight(
@@ -875,10 +879,10 @@ def _device_limits(device_index: int | None) -> tuple[int, int]:
 
 
 @cache
-def _supports_pdl(device_index: int | None) -> bool:
-    """Whether `device_index` supports Hopper+ PDL (SM90+)."""
+def _use_hopper_kernel(device_index: int | None) -> bool:
+    """Whether `device_index` uses `HopperMxfp8Gemv` (SM90)."""
     props = torch.cuda.get_device_properties(device_index)
-    return props.major >= 9
+    return props.major == 9
 
 
 # default_config's SM80 cost model, in bytes read by the busiest SM: an x byte
@@ -891,7 +895,10 @@ BLOCK_COST = 2 << 10
 # Column splits whose last CTA reads more partial-sum bytes are not tried.
 MAX_SPLIT_READ = 96 << 10
 
-# SM90+ HopperMxfp8Gemv cost model constants.
+# SM90 HopperMxfp8Gemv cost model constants: HOPPER_WARPS_PER_SM=24 matches the
+# worst-case register footprint at x_tiles=6 (74-77 regs/thread, 0 spills -> 25
+# warps/SM; x_tiles=1..3 use 44-55 regs/thread), bounding warp-limited CTA
+# residency per SM alongside shared memory residency.
 HOPPER_WARPS_PER_SM = 24
 HOPPER_MAX_RESIDENCY = 4
 HOPPER_X_COST = 0.25
@@ -903,7 +910,15 @@ HOPPER_SPLIT_STEP_COST = 6 << 10
 def _ampere_default_config(
     n: int, k: int, rows: int, sms: int, smem_limit: int
 ) -> GemvConfig:
-    """SM80 `Mxfp8Gemv` work-split search."""
+    """SM80 `Mxfp8Gemv` work-split search.
+
+    Candidates: CTAs of 1 to 16 warps (a power of two) that fit the device's
+    shared memory, at most 16 blocks per warp, between half and four times as
+    many CTAs as SMs (when any split allows it), and column splits whose last
+    CTA reads at most `MAX_SPLIT_READ`. Picks the candidate whose busiest SM
+    has the least modeled cost (the SM80 constants above, fitted to sweeps of
+    the DeepSeek-V4.1 shapes).
+    """
     x_tiles = (rows + X_TILE - 1) // X_TILE
     tiles = n // TILE_ROWS
     k_groups = k // GROUP
@@ -937,14 +952,19 @@ def _ampere_default_config(
     return min(candidates, key=lambda c: (c[0], c[1]))[2]
 
 
-@cache
 def _hopper_default_config(
     n: int, k: int, x_tiles: int, sms: int, smem_limit: int
 ) -> GemvConfig:
-    """SM90+ `HopperMxfp8Gemv` wave-aware work-split search.
+    """SM90 `HopperMxfp8Gemv` wave- and residency-aware work-split search.
 
-    Allows non-power-of-two `warps_n` (5) and `warps_k` (3) so shapes such as
-    K=288 (9 groups) and N=5120 (320 tiles) fill all SMs evenly.
+    Candidates: CTAs of up to 16 warps including non-power-of-two `warps_n=5`
+    and `warps_k=3` (for shapes such as `K=288` with 9 groups and `N=5120`
+    with 320 tiles), at most 16 blocks per warp, fitting `smem_limit` and
+    `MAX_SPLIT_READ`. Prefers launches filling at least `min_ctas` (`sms` for
+    `x_tiles == 1`, `(3 * sms) // 4` otherwise) up to
+    `HOPPER_MAX_RESIDENCY * sms`, and models per-SM work plus SM-underfill
+    and multi-wave tail penalties using register- and SMEM-bounded residency
+    (`HOPPER_WARPS_PER_SM` = 24, ~85 regs/thread).
     """
     rows = x_tiles * X_TILE
     tiles = n // TILE_ROWS
@@ -999,8 +1019,7 @@ def _hopper_default_config(
                     )
                 fills = min_ctas <= ctas <= HOPPER_MAX_RESIDENCY * sms
                 candidates.append((not fills, cost, config))
-    if not candidates:
-        return _ampere_default_config(n, k, rows, sms, smem_limit)
+    assert candidates, f"no split fits a {n} x {k} weight"
     return min(candidates, key=lambda c: (c[0], c[1]))[2]
 
 
@@ -1008,43 +1027,25 @@ def _hopper_default_config(
 def default_config(n: int, k: int, rows: int, device: torch.device) -> GemvConfig:
     """The work split of a shape (module docstring)."""
     sms, smem_limit = _device_limits(device.index)
-    if _supports_pdl(device.index):
+    if _use_hopper_kernel(device.index):
         x_tiles = (rows + X_TILE - 1) // X_TILE
         return _hopper_default_config(n, k, x_tiles, sms, smem_limit)
     return _ampere_default_config(n, k, rows, sms, smem_limit)
 
 
-def max_partials_size(n: int, k: int, device: torch.device) -> int:
-    """FP32 element count for a persistent `partials` buffer covering
-    `default_config` across `1..MAX_ROWS` rows (0 when no row count splits K)."""
-    max_work = 0
-    for rows in range(1, MAX_ROWS + 1):
-        config = default_config(n, k, rows, device)
-        splits = config.splits(k)
-        if splits > 1:
-            x_tiles = (rows + X_TILE - 1) // X_TILE
-            max_work = max(max_work, splits * X_TILE * x_tiles * n)
-    return max_work
-
-
 @cache
-def _kernel(device_index: int, n: int, k: int, x_tiles: int, config: GemvConfig):
-    """`Mxfp8Gemv` compiled for a device."""
+def _kernel(
+    device_index: int,
+    n: int,
+    k: int,
+    x_tiles: int,
+    config: GemvConfig,
+    kernel_cls: type[Mxfp8Gemv] = Mxfp8Gemv,
+):
+    """`kernel_cls` compiled for a device."""
     with torch.accelerator.device_index(device_index):
         return cute.compile(
-            Mxfp8Gemv(n, k, x_tiles, config),
-            *(Int64(0),) * 6,
-            *(Int32(1),) * 3,
-            make_fake_stream(),
-        )
-
-
-@cache
-def _hopper_kernel(device_index: int, n: int, k: int, x_tiles: int, config: GemvConfig):
-    """`HopperMxfp8Gemv` compiled for a device."""
-    with torch.accelerator.device_index(device_index):
-        return cute.compile(
-            HopperMxfp8Gemv(n, k, x_tiles, config),
+            kernel_cls(n, k, x_tiles, config),
             *(Int64(0),) * 6,
             *(Int32(1),) * 3,
             make_fake_stream(),
@@ -1064,16 +1065,13 @@ def mxfp8_gemv(
     out: torch.Tensor | None = None,
     config: GemvConfig | None = None,
     counters: torch.Tensor | None = None,
-    partials: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """`x [M, K] . dequant(W)^T` as BF16 `[M, N]`, for `M <= 48`.
 
     `weight` and `scales` come from `pack_weight`; `x` is BF16 with
     16-byte aligned rows. `config` overrides `default_config`.
     `counters` (int32, zero, at least `N / 16`) replaces the device's
-    shared ticket counters. `partials` (optional contiguous float32 scratch
-    buffer of at least `splits * ceil(M / 8) * 8 * N` elements) avoids
-    per-call workspace allocation when `splits > 1`.
+    shared ticket counters.
     """
     rows, k = x.shape
     n = weight.shape[0] * TILE_ROWS
@@ -1099,18 +1097,11 @@ def mxfp8_gemv(
     work = splits * X_TILE * x_tiles * n if splits > 1 else 0
     if work == 0:
         partials_ptr = Int64(0)
-    elif partials is not None and partials.numel() >= work:
-        assert partials.dtype == torch.float32 and partials.is_contiguous()
-        partials_ptr = Int64(partials.data_ptr())
     else:
         partials = torch.empty(work, dtype=torch.float32, device=x.device)
         partials_ptr = Int64(partials.data_ptr())
-    kernel = (
-        _hopper_kernel(device, n, k, x_tiles, config)
-        if _supports_pdl(device)
-        else _kernel(device, n, k, x_tiles, config)
-    )
-    kernel(
+    kernel_cls = HopperMxfp8Gemv if _use_hopper_kernel(device) else Mxfp8Gemv
+    _kernel(device, n, k, x_tiles, config, kernel_cls)(
         Int64(weight.data_ptr()),
         Int64(scales.data_ptr()),
         Int64(x.data_ptr()),
