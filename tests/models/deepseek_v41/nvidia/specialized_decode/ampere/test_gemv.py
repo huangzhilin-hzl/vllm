@@ -211,27 +211,27 @@ def test_hopper_config_scales_with_sm_count():
     for sms in (78, 132):
         for n, k in SHAPES:
             for x_tiles in (1, 6):
-                cfg = gemv._hopper_default_config(n, k, x_tiles, sms, 232448)
-                hopper_k = gemv.HopperMxfp8Gemv(n, k, x_tiles, cfg)
-                amp_k = gemv.Mxfp8Gemv(n, k, x_tiles, cfg)
-                assert hopper_k.smem_bytes() < amp_k.smem_bytes()
-                assert hopper_k.smem_bytes() <= 232448
+                config = gemv._hopper_default_config(n, k, x_tiles, sms, 232448)
+                hopper_kernel = gemv.HopperMxfp8Gemv(n, k, x_tiles, config)
+                ampere_kernel = gemv.Mxfp8Gemv(n, k, x_tiles, config)
+                assert hopper_kernel.smem_bytes() < ampere_kernel.smem_bytes()
+                assert hopper_kernel.smem_bytes() <= 232448
     # K=288 (9 groups) uses non-power-of-two warps_k=3 on both 78 and 132 SMs.
     assert gemv._hopper_default_config(5120, 288, 1, 78, 232448).warps_k == 3
     assert gemv._hopper_default_config(5120, 288, 1, 132, 232448).warps_k == 3
     # Larger SM count launches more CTAs rather than pinning to 78-SM tuning.
-    cfg_78 = gemv._hopper_default_config(5120, 1024, 1, 78, 232448)
-    cfg_132 = gemv._hopper_default_config(5120, 1024, 1, 132, 232448)
-    ctas_78 = (5120 // gemv.TILE_ROWS // cfg_78.warps_n) * cfg_78.splits(1024)
-    ctas_132 = (5120 // gemv.TILE_ROWS // cfg_132.warps_n) * cfg_132.splits(1024)
+    config_78 = gemv._hopper_default_config(5120, 1024, 1, 78, 232448)
+    config_132 = gemv._hopper_default_config(5120, 1024, 1, 132, 232448)
+    ctas_78 = (5120 // gemv.TILE_ROWS // config_78.warps_n) * config_78.splits(1024)
+    ctas_132 = (5120 // gemv.TILE_ROWS // config_132.warps_n) * config_132.splits(1024)
     assert ctas_132 > ctas_78
 
     # Exercise the real device-property lookup and dispatch path.
     device = torch.device(DEVICE, 0)
     sms, smem_limit = gemv._device_limits(device.index)
     for n, k in SHAPES:
-        cfg = gemv.default_config(n, k, 6, device)
+        config = gemv.default_config(n, k, 6, device)
         if gemv._supports_pdl(device.index):
-            assert cfg == gemv._hopper_default_config(n, k, 1, sms, smem_limit)
+            assert config == gemv._hopper_default_config(n, k, 1, sms, smem_limit)
         else:
-            assert cfg == gemv._ampere_default_config(n, k, 6, sms, smem_limit)
+            assert config == gemv._ampere_default_config(n, k, 6, sms, smem_limit)

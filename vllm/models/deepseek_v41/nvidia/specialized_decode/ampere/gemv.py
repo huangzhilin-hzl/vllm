@@ -223,7 +223,7 @@ def mma_bf16(c: list, a: list, b: list, *, loc=None, ip=None) -> list:
 
 
 @dsl_user_op
-def load_weights_cg(address: Int64, *, loc=None, ip=None) -> list:
+def load_weights(address: Int64, *, loc=None, ip=None) -> list:
     """Ordered 16-byte global weight load bypassing L1 (`ld.global.cg.v4.u32`).
 
     Marked with side effects so LLVM/ptxas keeps software-pipelined prefetch
@@ -665,31 +665,33 @@ class HopperMxfp8Gemv(Mxfp8Gemv):
         storage = smem.allocate(Storage)
         x_base = Int32(storage.buf.data_ptr().toint())
 
-        # Prefetch initial weight blocks & scales before waiting on producer.
-        w_base = (
+        # Prefetch initial weight blocks and scales before waiting on producer.
+        weight_base = (
             weight
             + (Int64(tile) * k_groups + Int64(first)) * BLOCK_BYTES
             + Int64(lane) * LANE_BYTES
         )
-        s_row = tile // 2
-        s_base = scales + (Int64(s_row) * k_groups + Int64(first)) * 4
-        prefetch = min(groups, 2 if self.x_tiles >= 4 else 3)
-        w_buf = cute.make_rmem_tensor(cute.make_layout((prefetch, 4)), Uint32)
-        s_buf = cute.make_rmem_tensor(cute.make_layout(prefetch), Uint32)
-        for p in cutlass.range_constexpr(prefetch):
-            s_buf[p] = load_u32(s_base + Int64(p) * 4)
-            loaded_w = load_weights_cg(w_base + Int64(p) * BLOCK_BYTES)
+        scale_row = tile // 2
+        scale_base = scales + (Int64(scale_row) * k_groups + Int64(first)) * 4
+        prefetch_stages = min(groups, 2 if self.x_tiles >= 4 else 3)
+        weight_buffer = cute.make_rmem_tensor(
+            cute.make_layout((prefetch_stages, 4)), Uint32
+        )
+        scale_buffer = cute.make_rmem_tensor(cute.make_layout(prefetch_stages), Uint32)
+        for stage in cutlass.range_constexpr(prefetch_stages):
+            scale_buffer[stage] = load_u32(scale_base + Int64(stage) * 4)
+            loaded_weights = load_weights(weight_base + Int64(stage) * BLOCK_BYTES)
             for j in cutlass.range_constexpr(4):
-                w_buf[p, j] = loaded_w[j]
+                weight_buffer[stage, j] = loaded_weights[j]
 
         cute.arch.griddepcontrol_wait()
 
         # Copy CTA's columns of `x` into SMEM via cp.async with bank-conflict padding.
         vectors = self.cta_cols // 8
-        total_x = self.x_rows * vectors
-        for it in cutlass.range_constexpr((total_x + self.threads - 1) // self.threads):
+        total = self.x_rows * vectors
+        for it in cutlass.range_constexpr((total + self.threads - 1) // self.threads):
             c = tid + it * self.threads
-            if c < total_x:
+            if c < total:
                 r = c // vectors
                 v = c % vectors
                 source = x
@@ -713,16 +715,18 @@ class HopperMxfp8Gemv(Mxfp8Gemv):
         acc.fill(0.0)
 
         for i in cutlass.range_constexpr(groups):
-            slot = i % prefetch
-            scale = s_buf[slot]
-            raw = [w_buf[slot, j] for j in range(4)]
+            stage = i % prefetch_stages
+            scale = scale_buffer[stage]
+            raw = [weight_buffer[stage, j] for j in range(4)]
 
-            if cutlass.const_expr(i + prefetch < groups):
-                nxt = i + prefetch
-                s_buf[slot] = load_u32(s_base + Int64(nxt) * 4)
-                loaded_n = load_weights_cg(w_base + Int64(nxt) * BLOCK_BYTES)
+            if cutlass.const_expr(i + prefetch_stages < groups):
+                next_group = i + prefetch_stages
+                scale_buffer[stage] = load_u32(scale_base + Int64(next_group) * 4)
+                loaded_weights = load_weights(
+                    weight_base + Int64(next_group) * BLOCK_BYTES
+                )
                 for j in cutlass.range_constexpr(4):
-                    w_buf[slot, j] = loaded_n[j]
+                    weight_buffer[stage, j] = loaded_weights[j]
 
             a = []
             for j in cutlass.range_constexpr(4):
@@ -964,20 +968,21 @@ def _hopper_default_config(
                 ):
                     continue
                 ctas = kernel.row_blocks * kernel.splits
-                res_by_reg = max(1, HOPPER_WARPS_PER_SM // warps)
-                res_by_smem = max(1, smem_limit // max(smem, 1))
-                res = min(HOPPER_MAX_RESIDENCY, res_by_reg, res_by_smem)
-                wave_cap = sms * res
-                waves = -(-ctas // wave_cap)
-                ctas_per_sm = -(-ctas // sms)
+                warp_residency = max(1, HOPPER_WARPS_PER_SM // warps)
+                smem_residency = max(1, smem_limit // max(smem, 1))
+                residency = min(HOPPER_MAX_RESIDENCY, warp_residency, smem_residency)
+                wave_capacity = sms * residency
+                waves = -(-ctas // wave_capacity)
+                busiest = -(-ctas // sms)
                 sm_penalty = 0 if ctas >= min_ctas else (min_ctas - ctas) * 2048
                 tail_penalty = (
                     0
-                    if ctas <= wave_cap
-                    else (waves * wave_cap - ctas) * 512 + waves * (waves - 1) * 32768
+                    if ctas <= wave_capacity
+                    else (waves * wave_capacity - ctas) * 512
+                    + waves * (waves - 1) * 32768
                 )
                 cost = (
-                    ctas_per_sm
+                    busiest
                     * (
                         kernel.cta_rows * kernel.cta_cols
                         + HOPPER_X_COST * 2 * rows * kernel.cta_cols
@@ -1014,8 +1019,8 @@ def max_partials_size(n: int, k: int, device: torch.device) -> int:
     `default_config` across `1..MAX_ROWS` rows (0 when no row count splits K)."""
     max_work = 0
     for rows in range(1, MAX_ROWS + 1):
-        cfg = default_config(n, k, rows, device)
-        splits = cfg.splits(k)
+        config = default_config(n, k, rows, device)
+        splits = config.splits(k)
         if splits > 1:
             x_tiles = (rows + X_TILE - 1) // X_TILE
             max_work = max(max_work, splits * X_TILE * x_tiles * n)
@@ -1100,12 +1105,12 @@ def mxfp8_gemv(
     else:
         partials = torch.empty(work, dtype=torch.float32, device=x.device)
         partials_ptr = Int64(partials.data_ptr())
-    kernel_fn = (
+    kernel = (
         _hopper_kernel(device, n, k, x_tiles, config)
         if _supports_pdl(device)
         else _kernel(device, n, k, x_tiles, config)
     )
-    kernel_fn(
+    kernel(
         Int64(weight.data_ptr()),
         Int64(scales.data_ptr()),
         Int64(x.data_ptr()),
