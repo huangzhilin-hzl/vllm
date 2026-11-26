@@ -19,7 +19,7 @@ and cuBLAS.
 * The row-expanded scale copy the loader keeps, and CUDA-graph replay.
 
 SM80 runs the `cp.async` kernel (`Mxfp8Gemv`) and SM90+ runs the zero-weight-SMEM
-register-streaming PDL kernel (`RegStreamPdlMxfp8Gemv`).
+register-streaming PDL kernel (`HopperMxfp8Gemv`).
 """
 
 import pytest
@@ -202,7 +202,7 @@ def test_persistent_partials_and_non_pow2_config():
         assert torch.equal(out, gemv.mxfp8_gemv(x, weight, block_scales))
 
 
-def test_regstream_config_scales_with_sm_count():
+def test_hopper_config_scales_with_sm_count():
     """SM90+ register-streaming config selection adapts to device SM count,
     uses strictly less shared memory than the SM80 weight-SMEM kernel, and
     matches real-device `default_config` dispatch."""
@@ -211,17 +211,17 @@ def test_regstream_config_scales_with_sm_count():
     for sms in (78, 132):
         for n, k in SHAPES:
             for x_tiles in (1, 6):
-                cfg = gemv._regstream_default_config(n, k, x_tiles, sms, 232448)
-                reg_k = gemv.RegStreamPdlMxfp8Gemv(n, k, x_tiles, cfg)
+                cfg = gemv._hopper_default_config(n, k, x_tiles, sms, 232448)
+                hopper_k = gemv.HopperMxfp8Gemv(n, k, x_tiles, cfg)
                 amp_k = gemv.Mxfp8Gemv(n, k, x_tiles, cfg)
-                assert reg_k.smem_bytes() < amp_k.smem_bytes()
-                assert reg_k.smem_bytes() <= 232448
+                assert hopper_k.smem_bytes() < amp_k.smem_bytes()
+                assert hopper_k.smem_bytes() <= 232448
     # K=288 (9 groups) uses non-power-of-two warps_k=3 on both 78 and 132 SMs.
-    assert gemv._regstream_default_config(5120, 288, 1, 78, 232448).warps_k == 3
-    assert gemv._regstream_default_config(5120, 288, 1, 132, 232448).warps_k == 3
+    assert gemv._hopper_default_config(5120, 288, 1, 78, 232448).warps_k == 3
+    assert gemv._hopper_default_config(5120, 288, 1, 132, 232448).warps_k == 3
     # Larger SM count launches more CTAs rather than pinning to 78-SM tuning.
-    cfg_78 = gemv._regstream_default_config(5120, 1024, 1, 78, 232448)
-    cfg_132 = gemv._regstream_default_config(5120, 1024, 1, 132, 232448)
+    cfg_78 = gemv._hopper_default_config(5120, 1024, 1, 78, 232448)
+    cfg_132 = gemv._hopper_default_config(5120, 1024, 1, 132, 232448)
     ctas_78 = (5120 // gemv.TILE_ROWS // cfg_78.warps_n) * cfg_78.splits(1024)
     ctas_132 = (5120 // gemv.TILE_ROWS // cfg_132.warps_n) * cfg_132.splits(1024)
     assert ctas_132 > ctas_78
@@ -231,7 +231,7 @@ def test_regstream_config_scales_with_sm_count():
     sms, smem_limit = gemv._device_limits(device.index)
     for n, k in SHAPES:
         cfg = gemv.default_config(n, k, 6, device)
-        if gemv._supports_regstream_pdl(device.index):
-            assert cfg == gemv._regstream_default_config(n, k, 1, sms, smem_limit)
+        if gemv._supports_pdl(device.index):
+            assert cfg == gemv._hopper_default_config(n, k, 1, sms, smem_limit)
         else:
             assert cfg == gemv._ampere_default_config(n, k, 6, sms, smem_limit)

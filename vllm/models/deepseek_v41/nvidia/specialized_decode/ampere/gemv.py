@@ -44,7 +44,7 @@ columns: warp `(wn, wk)` the 16 rows of tile `wn` and the `groups`
 - On SM80 (`Mxfp8Gemv`), all copies are `cp.async` to shared memory, issued
   before any is used: first `x` and scale factors, then each warp's weight
   blocks, one copy group per block.
-- On SM90+ (`RegStreamPdlMxfp8Gemv`), weights and scales bypass shared memory
+- On SM90+ (`HopperMxfp8Gemv`), weights and scales bypass shared memory
   and stream directly into a 2- or 3-stage register ring via ordered
   `ld.global.cg.v4.u32` (preventing load sinking) and `ld.global.nc.u32`.
   Hopper PDL (`use_pdl=True`) prefetches the first weight blocks before
@@ -587,7 +587,7 @@ class Mxfp8Gemv:
                     store_u32(counter, Uint32(0))
 
 
-class RegStreamPdlMxfp8Gemv(Mxfp8Gemv):
+class HopperMxfp8Gemv(Mxfp8Gemv):
     """Zero-weight-SMEM register-streaming MXFP8 GEMV with Hopper+ PDL.
 
     Weights and scales bypass shared memory and stream into a 2- or 3-stage
@@ -871,7 +871,7 @@ def _device_limits(device_index: int | None) -> tuple[int, int]:
 
 
 @cache
-def _supports_regstream_pdl(device_index: int | None) -> bool:
+def _supports_pdl(device_index: int | None) -> bool:
     """Whether `device_index` supports Hopper+ PDL (SM90+)."""
     props = torch.cuda.get_device_properties(device_index)
     return props.major >= 9
@@ -887,13 +887,13 @@ BLOCK_COST = 2 << 10
 # Column splits whose last CTA reads more partial-sum bytes are not tried.
 MAX_SPLIT_READ = 96 << 10
 
-# SM90+ RegStreamPdlMxfp8Gemv cost model constants.
-REGSTREAM_WARPS_PER_SM = 24
-REGSTREAM_MAX_RESIDENCY = 4
-REGSTREAM_X_COST = 0.25
-REGSTREAM_BLOCK_COST = 1 << 10
-REGSTREAM_SPLIT_COST = 48 << 10
-REGSTREAM_SPLIT_STEP_COST = 6 << 10
+# SM90+ HopperMxfp8Gemv cost model constants.
+HOPPER_WARPS_PER_SM = 24
+HOPPER_MAX_RESIDENCY = 4
+HOPPER_X_COST = 0.25
+HOPPER_BLOCK_COST = 1 << 10
+HOPPER_SPLIT_COST = 48 << 10
+HOPPER_SPLIT_STEP_COST = 6 << 10
 
 
 def _ampere_default_config(
@@ -934,10 +934,10 @@ def _ampere_default_config(
 
 
 @cache
-def _regstream_default_config(
+def _hopper_default_config(
     n: int, k: int, x_tiles: int, sms: int, smem_limit: int
 ) -> GemvConfig:
-    """SM90+ `RegStreamPdlMxfp8Gemv` wave-aware work-split search.
+    """SM90+ `HopperMxfp8Gemv` wave-aware work-split search.
 
     Allows non-power-of-two `warps_n` (5) and `warps_k` (3) so shapes such as
     K=288 (9 groups) and N=5120 (320 tiles) fill all SMs evenly.
@@ -956,7 +956,7 @@ def _regstream_default_config(
                 if k_groups % (warps_k * groups):
                     continue
                 config = GemvConfig(warps_n, warps_k, groups)
-                kernel = RegStreamPdlMxfp8Gemv(n, k, x_tiles, config)
+                kernel = HopperMxfp8Gemv(n, k, x_tiles, config)
                 smem = kernel.smem_bytes()
                 split_read = kernel.splits * kernel.cta_rows * kernel.x_rows * 4
                 if smem > smem_limit or (
@@ -964,9 +964,9 @@ def _regstream_default_config(
                 ):
                     continue
                 ctas = kernel.row_blocks * kernel.splits
-                res_by_reg = max(1, REGSTREAM_WARPS_PER_SM // warps)
+                res_by_reg = max(1, HOPPER_WARPS_PER_SM // warps)
                 res_by_smem = max(1, smem_limit // max(smem, 1))
-                res = min(REGSTREAM_MAX_RESIDENCY, res_by_reg, res_by_smem)
+                res = min(HOPPER_MAX_RESIDENCY, res_by_reg, res_by_smem)
                 wave_cap = sms * res
                 waves = -(-ctas // wave_cap)
                 ctas_per_sm = -(-ctas // sms)
@@ -980,19 +980,19 @@ def _regstream_default_config(
                     ctas_per_sm
                     * (
                         kernel.cta_rows * kernel.cta_cols
-                        + REGSTREAM_X_COST * 2 * rows * kernel.cta_cols
-                        + REGSTREAM_BLOCK_COST * groups
+                        + HOPPER_X_COST * 2 * rows * kernel.cta_cols
+                        + HOPPER_BLOCK_COST * groups
                     )
                     + sm_penalty
                     + tail_penalty
                 )
                 if kernel.splits > 1:
                     cost += (
-                        REGSTREAM_SPLIT_COST
-                        + kernel.splits * REGSTREAM_SPLIT_STEP_COST
+                        HOPPER_SPLIT_COST
+                        + kernel.splits * HOPPER_SPLIT_STEP_COST
                         + kernel.splits * kernel.cta_rows * rows * 4
                     )
-                fills = min_ctas <= ctas <= REGSTREAM_MAX_RESIDENCY * sms
+                fills = min_ctas <= ctas <= HOPPER_MAX_RESIDENCY * sms
                 candidates.append((not fills, cost, config))
     if not candidates:
         return _ampere_default_config(n, k, rows, sms, smem_limit)
@@ -1003,9 +1003,9 @@ def _regstream_default_config(
 def default_config(n: int, k: int, rows: int, device: torch.device) -> GemvConfig:
     """The work split of a shape (module docstring)."""
     sms, smem_limit = _device_limits(device.index)
-    if _supports_regstream_pdl(device.index):
+    if _supports_pdl(device.index):
         x_tiles = (rows + X_TILE - 1) // X_TILE
-        return _regstream_default_config(n, k, x_tiles, sms, smem_limit)
+        return _hopper_default_config(n, k, x_tiles, sms, smem_limit)
     return _ampere_default_config(n, k, rows, sms, smem_limit)
 
 
@@ -1035,13 +1035,11 @@ def _kernel(device_index: int, n: int, k: int, x_tiles: int, config: GemvConfig)
 
 
 @cache
-def _regstream_kernel(
-    device_index: int, n: int, k: int, x_tiles: int, config: GemvConfig
-):
-    """`RegStreamPdlMxfp8Gemv` compiled for a device."""
+def _hopper_kernel(device_index: int, n: int, k: int, x_tiles: int, config: GemvConfig):
+    """`HopperMxfp8Gemv` compiled for a device."""
     with torch.accelerator.device_index(device_index):
         return cute.compile(
-            RegStreamPdlMxfp8Gemv(n, k, x_tiles, config),
+            HopperMxfp8Gemv(n, k, x_tiles, config),
             *(Int64(0),) * 6,
             *(Int32(1),) * 3,
             make_fake_stream(),
@@ -1103,8 +1101,8 @@ def mxfp8_gemv(
         partials = torch.empty(work, dtype=torch.float32, device=x.device)
         partials_ptr = Int64(partials.data_ptr())
     kernel_fn = (
-        _regstream_kernel(device, n, k, x_tiles, config)
-        if _supports_regstream_pdl(device)
+        _hopper_kernel(device, n, k, x_tiles, config)
+        if _supports_pdl(device)
         else _kernel(device, n, k, x_tiles, config)
     )
     kernel_fn(
